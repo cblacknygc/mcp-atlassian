@@ -271,7 +271,7 @@ class LinksMixin(JiraClient):
             Dictionary with the result of the operation
 
         Raises:
-            ValueError: If link_id is empty
+            ValueError: If link_id is not an ASCII decimal identifier
             MCPAtlassianAuthenticationError: If authentication fails
                 with the Jira API (401/403)
             Exception: If there is an error removing the issue link
@@ -279,6 +279,8 @@ class LinksMixin(JiraClient):
         # Validate input
         if not link_id:
             raise ValueError("Link ID is required")
+        if not link_id.isascii() or not link_id.isdecimal():
+            raise ValueError("Link ID must contain only ASCII digits")
 
         try:
             self.jira.remove_issue_link(link_id)

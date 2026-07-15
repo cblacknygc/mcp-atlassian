@@ -262,6 +262,16 @@ class TestLinksMixin:
         with pytest.raises(ValueError, match="Link ID is required"):
             links_mixin.remove_issue_link("")
 
+    @pytest.mark.parametrize(
+        "link_id",
+        ["../issue/PROJ-1", "1/../issue/PROJ-1", "10000?expand=x", "١٠٠٠٠"],
+    )
+    def test_remove_issue_link_rejects_non_ascii_numeric_id(self, links_mixin, link_id):
+        with pytest.raises(ValueError, match="ASCII digits"):
+            links_mixin.remove_issue_link(link_id)
+
+        links_mixin.jira.remove_issue_link.assert_not_called()
+
     def test_remove_issue_link_authentication_error(self, links_mixin):
         link_id = "10000"
         links_mixin.jira.remove_issue_link.side_effect = HTTPError(
