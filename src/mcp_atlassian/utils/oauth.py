@@ -181,8 +181,7 @@ class OAuthConfig:
 
             if not response.ok:
                 logger.error(
-                    f"Token exchange failed with status {response.status_code}. "
-                    f"Response: {response.text}"
+                    f"Token exchange failed with status {response.status_code}."
                 )
                 return False
 
@@ -245,10 +244,6 @@ class OAuthConfig:
             logger.error(
                 f"Failed to decode JSON response from token endpoint: {e}",
                 exc_info=True,
-            )
-            logger.error(
-                f"Response text that failed to parse: "
-                f"{response.text if 'response' in locals() else 'Response object not available'}"
             )
             return False
         except Exception as e:

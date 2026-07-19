@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -347,10 +348,6 @@ def test_standalone_success_does_not_log_client_secret(
 
 
 @pytest.mark.security_regression
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase B must not log complete OAuth token-endpoint response bodies",
-)
 def test_oauth_exchange_failure_does_not_log_echoed_secrets(
     sentinels: SecretSentinels, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -381,4 +378,39 @@ def test_oauth_exchange_failure_does_not_log_echoed_secrets(
 
     sentinels.assert_absent(
         format_log_records(caplog.records), context="OAuth exchange failure logs"
+    )
+
+
+@pytest.mark.security_regression
+def test_oauth_exchange_invalid_json_does_not_log_response_body(
+    sentinels: SecretSentinels, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Invalid token responses must not be copied into exception diagnostics."""
+    config = OAuthConfig(
+        client_id="inert-client-id",
+        client_secret=sentinels["client_secret"],
+        redirect_uri="https://callback.example.invalid/callback",
+        scope="WRITE",
+        base_url="https://jira.example.invalid",
+    )
+    response = SimpleNamespace(
+        ok=True,
+        status_code=200,
+        text=(
+            f"access_token={sentinels['access_token']} "
+            f"refresh_token={sentinels['refresh_token']}"
+        ),
+        json=MagicMock(
+            side_effect=json.JSONDecodeError("invalid token response", "body", 0)
+        ),
+    )
+
+    with (
+        patch("mcp_atlassian.utils.oauth.requests.post", return_value=response),
+        caplog.at_level(logging.ERROR, logger="mcp-atlassian.oauth"),
+    ):
+        assert config.exchange_code_for_tokens(sentinels["authorization_code"]) is False
+
+    sentinels.assert_absent(
+        format_log_records(caplog.records), context="OAuth invalid-JSON logs"
     )
