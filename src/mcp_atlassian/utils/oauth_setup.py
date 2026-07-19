@@ -251,10 +251,11 @@ def run_oauth_flow(args: OAuthSetupArgs) -> bool:
     auth_url = oauth_config.get_authorization_url(state=state)
 
     # Open the browser for authorization
-    logger.info(f"Opening browser for authorization at {auth_url}")
+    logger.info("Opening browser for authorization (URL query omitted from logs)")
     webbrowser.open(auth_url)
     logger.info(
-        "If the browser doesn't open automatically, please visit this URL manually."
+        "If the browser doesn't open automatically, check your default browser "
+        "settings and retry."
     )
 
     # Wait for the callback

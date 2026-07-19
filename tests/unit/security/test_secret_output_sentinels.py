@@ -150,10 +150,6 @@ def test_packaged_helper_redacts_client_secret(
 
 
 @pytest.mark.security_regression
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase B must omit OAuth state from packaged helper authorization logs",
-)
 def test_packaged_helper_does_not_log_complete_state(
     sentinels: SecretSentinels,
     caplog: pytest.LogCaptureFixture,
@@ -167,6 +163,7 @@ def test_packaged_helper_does_not_log_complete_state(
             state=sentinels["expected_state"],
         )
 
+    assert "URL query omitted from logs" in caplog.text
     sentinels.assert_absent(
         format_log_records(caplog.records), context="packaged OAuth helper logs"
     )
