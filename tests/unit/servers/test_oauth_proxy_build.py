@@ -19,8 +19,15 @@ from mcp.server.auth.provider import AuthorizationCode
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
 
-from mcp_atlassian.servers.main import AtlassianMCP, _build_auth_provider
-from mcp_atlassian.servers.oauth_proxy import HardenedOAuthProxy
+from mcp_atlassian.servers.main import (
+    DCR_CLIENT_TTL_ENV,
+    AtlassianMCP,
+    _build_auth_provider,
+)
+from mcp_atlassian.servers.oauth_proxy import (
+    DEFAULT_DCR_CLIENT_TTL_SECONDS,
+    HardenedOAuthProxy,
+)
 from mcp_atlassian.utils.oauth import CLOUD_AUTHORIZE_URL, CLOUD_TOKEN_URL
 from mcp_atlassian.utils.token_verifier import AtlassianOpaqueTokenVerifier
 
@@ -459,6 +466,80 @@ async def test_register_client_hardens_grant_types_and_scopes(monkeypatch):
     assert stored is not None
     assert stored.grant_types == ["authorization_code"]
     assert stored.scope == "read:jira-work"
+
+
+@pytest.mark.anyio
+async def test_register_client_applies_default_expiry() -> None:
+    harness = _make_provider()
+    client = OAuthClientInformationFull(
+        client_id="expiring-client",
+        redirect_uris=[REDIRECT_URI],
+        token_endpoint_auth_method="none",
+    )
+
+    await harness.provider.register_client(client)
+    stored, ttl_seconds = await harness.provider._client_store.ttl(
+        key="expiring-client"
+    )
+
+    assert stored is not None
+    assert ttl_seconds == pytest.approx(DEFAULT_DCR_CLIENT_TTL_SECONDS, abs=2)
+
+
+@pytest.mark.anyio
+async def test_build_auth_provider_applies_configured_dcr_client_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
+    monkeypatch.setenv(DCR_CLIENT_TTL_ENV, "3600")
+    _set_required_oauth_env(monkeypatch, redirect_uri="http://localhost:3000/callback")
+
+    provider = _build_auth_provider()
+
+    assert provider is not None
+    client = OAuthClientInformationFull(
+        client_id="configured-expiry-client",
+        redirect_uris=[REDIRECT_URI],
+        token_endpoint_auth_method="none",
+    )
+    await provider.register_client(client)
+    stored, ttl_seconds = await provider._client_store.ttl(
+        key="configured-expiry-client"
+    )
+
+    assert stored is not None
+    assert ttl_seconds == pytest.approx(3600, abs=2)
+
+
+@pytest.mark.parametrize("ttl_value", ["invalid", "0", "59"])
+def test_build_auth_provider_rejects_invalid_dcr_client_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    ttl_value: str,
+) -> None:
+    monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
+    monkeypatch.setenv(DCR_CLIENT_TTL_ENV, ttl_value)
+    _set_required_oauth_env(monkeypatch, redirect_uri="http://localhost:3000/callback")
+
+    with pytest.raises(ValueError, match=DCR_CLIENT_TTL_ENV):
+        _build_auth_provider()
+
+
+@pytest.mark.anyio
+async def test_dcr_client_expiry_does_not_change_other_storage_collections() -> None:
+    harness = _make_provider()
+
+    await harness.provider._client_storage.put(
+        key="unrelated-entry",
+        value={"kind": "transaction"},
+        collection="mcp-oauth-transactions",
+    )
+    stored, ttl_seconds = await harness.provider._client_storage.ttl(
+        key="unrelated-entry",
+        collection="mcp-oauth-transactions",
+    )
+
+    assert stored == {"kind": "transaction"}
+    assert ttl_seconds is None
 
 
 @pytest.mark.security_regression

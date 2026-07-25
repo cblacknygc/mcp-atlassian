@@ -7,9 +7,16 @@ from collections.abc import Iterable
 
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
+from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
+from key_value.aio.adapters.pydantic import PydanticAdapter
+from key_value.aio.wrappers.ttl_clamp import TTLClampWrapper
 from mcp.server.auth.provider import OAuthClientInformationFull
 
 logger = logging.getLogger("mcp-atlassian.server.oauth_proxy")
+
+DEFAULT_DCR_CLIENT_TTL_SECONDS = 30 * 24 * 60 * 60
+MIN_DCR_CLIENT_TTL_SECONDS = 60
+_DCR_CLIENT_COLLECTION = "mcp-oauth-proxy-clients"
 
 
 def _normalize_list(values: Iterable[str] | None) -> list[str] | None:
@@ -35,11 +42,31 @@ class HardenedOAuthProxy(OAuthProxy):
         *,
         allowed_grant_types: list[str] | None = None,
         forced_scopes: list[str] | None = None,
+        dcr_client_ttl_seconds: int = DEFAULT_DCR_CLIENT_TTL_SECONDS,
         **kwargs: object,
     ) -> None:
+        if dcr_client_ttl_seconds < MIN_DCR_CLIENT_TTL_SECONDS:
+            raise ValueError(
+                f"dcr_client_ttl_seconds must be at least {MIN_DCR_CLIENT_TTL_SECONDS}"
+            )
+
         super().__init__(**kwargs)
         self._allowed_grant_types = _normalize_list(allowed_grant_types)
         self._forced_scopes = _normalize_list(forced_scopes)
+        # FastMCP writes DCR clients with ttl=None. Replace only that adapter so
+        # client registrations expire while codes, transactions, and tokens keep
+        # their existing collection-specific TTL behavior.
+        self._client_store = PydanticAdapter[ProxyDCRClient](
+            key_value=TTLClampWrapper(
+                key_value=self._client_storage,
+                min_ttl=MIN_DCR_CLIENT_TTL_SECONDS,
+                max_ttl=dcr_client_ttl_seconds,
+                missing_ttl=dcr_client_ttl_seconds,
+            ),
+            pydantic_model=ProxyDCRClient,
+            default_collection=_DCR_CLIENT_COLLECTION,
+            raise_on_validation_error=True,
+        )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         """Resolve an outer token and bind it to its upstream token set.
@@ -101,4 +128,9 @@ class HardenedOAuthProxy(OAuthProxy):
         await super().register_client(client_info)
 
 
-__all__ = ["HardenedOAuthProxy", "parse_env_list"]
+__all__ = [
+    "DEFAULT_DCR_CLIENT_TTL_SECONDS",
+    "HardenedOAuthProxy",
+    "MIN_DCR_CLIENT_TTL_SECONDS",
+    "parse_env_list",
+]
