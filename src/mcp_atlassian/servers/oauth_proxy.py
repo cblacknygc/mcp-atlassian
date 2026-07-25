@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 
+from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.oauth_proxy import OAuthProxy
 from mcp.server.auth.provider import OAuthClientInformationFull
 
@@ -39,6 +40,36 @@ class HardenedOAuthProxy(OAuthProxy):
         super().__init__(**kwargs)
         self._allowed_grant_types = _normalize_list(allowed_grant_types)
         self._forced_scopes = _normalize_list(forced_scopes)
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        """Resolve an outer token and bind it to its upstream token set.
+
+        FastMCP uses the access-token subject to prevent one authenticated
+        principal from reusing another principal's MCP session. Atlassian
+        access tokens are opaque, so use the proxy's stable, random upstream
+        token-set identifier as the subject without exposing either token.
+
+        Args:
+            token: FastMCP-issued outer bearer token.
+
+        Returns:
+            The validated upstream access token with a session-binding subject,
+            or ``None`` when the outer token is invalid or no longer mapped.
+        """
+        access_token = await super().load_access_token(token)
+        if access_token is None:
+            return None
+
+        payload = self.jwt_issuer.verify_token(token)
+        jti = payload.get("jti")
+        if not isinstance(jti, str):
+            return None
+
+        mapping = await self._jti_mapping_store.get(key=jti)
+        if mapping is None:
+            return None
+
+        return access_token.model_copy(update={"subject": mapping.upstream_token_id})
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         updates: dict[str, object] = {"response_types": ["code"]}
