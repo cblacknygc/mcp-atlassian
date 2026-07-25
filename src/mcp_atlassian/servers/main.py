@@ -46,7 +46,12 @@ from .confluence import confluence_mcp
 from .context import MainAppContext
 from .error_handling import ErrorPreservingFastMCP
 from .jira import jira_mcp
-from .oauth_proxy import HardenedOAuthProxy, parse_env_list
+from .oauth_proxy import (
+    DEFAULT_DCR_CLIENT_TTL_SECONDS,
+    MIN_DCR_CLIENT_TTL_SECONDS,
+    HardenedOAuthProxy,
+    parse_env_list,
+)
 
 logger = logging.getLogger("mcp-atlassian.server.main")
 
@@ -59,6 +64,7 @@ DEFAULT_ALLOWED_REDIRECT_URIS = [
 ]
 DEFAULT_ALLOWED_GRANT_TYPES = ["authorization_code", "refresh_token"]
 OAUTH_PROXY_ENABLE_ENV = "ATLASSIAN_OAUTH_PROXY_ENABLE"
+DCR_CLIENT_TTL_ENV = "ATLASSIAN_OAUTH_DCR_CLIENT_TTL_SECONDS"
 
 
 def _sanitize_schema_for_compatibility(tool: MCPTool) -> MCPTool:
@@ -775,6 +781,24 @@ def _get_allowed_grant_types() -> list[str]:
     return parsed
 
 
+def _get_dcr_client_ttl_seconds() -> int:
+    raw = os.getenv(DCR_CLIENT_TTL_ENV)
+    if raw is None:
+        return DEFAULT_DCR_CLIENT_TTL_SECONDS
+
+    try:
+        ttl_seconds = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{DCR_CLIENT_TTL_ENV} must be an integer") from exc
+
+    if ttl_seconds < MIN_DCR_CLIENT_TTL_SECONDS:
+        raise ValueError(
+            f"{DCR_CLIENT_TTL_ENV} must be at least "
+            f"{MIN_DCR_CLIENT_TTL_SECONDS} seconds"
+        )
+    return ttl_seconds
+
+
 def _resolve_upstream_oauth_endpoints(instance_url: str) -> tuple[str, str]:
     parsed_host = (urlparse(instance_url).hostname or "").lower()
     is_cloud = (
@@ -873,6 +897,7 @@ def _build_auth_provider() -> HardenedOAuthProxy | None:
         valid_scopes=scopes or None,
         allowed_grant_types=allowed_grant_types,
         forced_scopes=scopes or None,
+        dcr_client_ttl_seconds=_get_dcr_client_ttl_seconds(),
         token_endpoint_auth_method="client_secret_post",  # noqa: S106
         extra_authorize_params=(
             {"audience": "api.atlassian.com", "prompt": "consent"} if is_cloud else None
