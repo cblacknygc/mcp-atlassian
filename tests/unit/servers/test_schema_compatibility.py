@@ -12,7 +12,7 @@ keeping schemas valid.
 import json
 
 import pytest
-from mcp.types import Tool as MCPTool
+from mcp_types import Tool as MCPTool
 
 from mcp_atlassian.servers.main import _sanitize_schema_for_compatibility, main_mcp
 

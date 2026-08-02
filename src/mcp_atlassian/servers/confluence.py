@@ -11,7 +11,7 @@ from typing import Annotated
 from urllib.parse import parse_qs, urlsplit
 
 from fastmcp import Context
-from mcp.types import BlobResourceContents, EmbeddedResource, ImageContent, TextContent
+from mcp_types import BlobResourceContents, EmbeddedResource, ImageContent, TextContent
 from pydantic import BeforeValidator, Field
 
 from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError

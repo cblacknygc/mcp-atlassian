@@ -7,7 +7,7 @@ import logging
 from typing import Annotated, Any
 
 from fastmcp import Context
-from mcp.types import BlobResourceContents, EmbeddedResource, ImageContent, TextContent
+from mcp_types import BlobResourceContents, EmbeddedResource, ImageContent, TextContent
 from pydantic import AliasChoices, Field
 from requests.exceptions import HTTPError
 

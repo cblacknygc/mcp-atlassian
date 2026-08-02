@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pytest
 from fastmcp import Client
 from fastmcp.client import FastMCPTransport
-from mcp.types import CallToolResult, ImageContent, TextContent
+from mcp_types import CallToolResult, ImageContent, TextContent
 
 from mcp_atlassian.servers import main_mcp
 

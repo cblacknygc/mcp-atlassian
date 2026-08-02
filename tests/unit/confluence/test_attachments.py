@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, mock_open, patch
 
 import pytest
-from mcp.types import EmbeddedResource, TextContent
+from mcp_types import EmbeddedResource, TextContent
 
 from mcp_atlassian.confluence.attachments import AttachmentsMixin
 from mcp_atlassian.confluence.config import ConfluenceConfig

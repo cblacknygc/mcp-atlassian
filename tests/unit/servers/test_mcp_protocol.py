@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastmcp import Context
 from fastmcp.tools import Tool as FastMCPTool
-from mcp.types import Tool as MCPTool
+from mcp_types import Tool as MCPTool
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -94,7 +94,7 @@ class TestMCPProtocolIntegration:
         return server
 
     @pytest.mark.security_regression
-    async def test_call_tool_mcp_enforces_enablement_at_dispatch(
+    async def test_call_tool_enforces_enablement_at_dispatch(
         self, atlassian_mcp_server, mock_jira_config, mock_confluence_config
     ):
         """A tool filtered out of the listing must not be invocable by name.
@@ -136,19 +136,19 @@ class TestMCPProtocolIntegration:
         atlassian_mcp_server.get_tool = mock_get_tool
 
         with patch.object(
-            FastMCP, "_call_tool_mcp", new_callable=AsyncMock
+            FastMCP, "call_tool", new_callable=AsyncMock
         ) as mock_super:
             mock_super.return_value = "EXECUTED"
 
             # Write tool is read-only-excluded -> denied before reaching the executor.
             with pytest.raises(NotFoundError) as denied_exc:
-                await atlassian_mcp_server._call_tool_mcp("jira_create_issue", {})
+                await atlassian_mcp_server.call_tool("jira_create_issue", {})
             mock_super.assert_not_called()
 
             # Genuinely unknown tool -> denied by our override too (never reaches
             # super, whose repr-quoted message would leak tool existence).
             with pytest.raises(NotFoundError) as unknown_exc:
-                await atlassian_mcp_server._call_tool_mcp("jira_no_such_tool", {})
+                await atlassian_mcp_server.call_tool("jira_no_such_tool", {})
             mock_super.assert_not_called()
 
             # Message parity: hidden-but-existing and genuinely unknown tools
@@ -157,7 +157,7 @@ class TestMCPProtocolIntegration:
             assert str(unknown_exc.value) == "Unknown tool: jira_no_such_tool"
 
             # Read tool is enabled -> passes the gate and reaches the executor.
-            result = await atlassian_mcp_server._call_tool_mcp("jira_get_issue", {})
+            result = await atlassian_mcp_server.call_tool("jira_get_issue", {})
             assert result == "EXECUTED"
             mock_super.assert_called_once()
 

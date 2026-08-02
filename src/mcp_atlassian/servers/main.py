@@ -15,7 +15,7 @@ from fastmcp.exceptions import NotFoundError
 from fastmcp.server.event_store import EventStore
 from fastmcp.server.http import StarletteWithLifespan
 from fastmcp.tools import Tool as FastMCPTool
-from mcp.types import Tool as MCPTool
+from mcp_types import Tool as MCPTool
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -358,19 +358,30 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
         )
         return filtered_tools
 
-    async def _call_tool_mcp(self, key: str, arguments: dict[str, Any]) -> Any:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        version: Any = None,
+        run_middleware: bool = True,
+    ) -> Any:
         # Enforce the same enablement filter at call time as at listing time, so a
         # tool hidden from the listing (read-only mode, not in ENABLED_TOOLS, toolset
         # disabled, or service unavailable) cannot be invoked directly by name.
         # Under an active filter context, denials and genuinely unknown tools raise
-        # byte-identical messages here (no exists-but-disabled leak), decoupled from
-        # upstream's error format (FastMCP uses a repr-quoted name).
+        # byte-identical messages here (no exists-but-disabled leak).
         ctx = self._tool_filter_context()
         if ctx is not None:
-            tool_obj = await self.get_tool(key)
-            if tool_obj is None or not self._is_tool_authorized(key, tool_obj, ctx):
-                raise NotFoundError(f"Unknown tool: {key}")
-        return await super()._call_tool_mcp(key, arguments)
+            tool_obj = await self.get_tool(name, version=version)
+            if tool_obj is None or not self._is_tool_authorized(name, tool_obj, ctx):
+                raise NotFoundError(f"Unknown tool: {name}")
+        return await super().call_tool(
+            name,
+            arguments,
+            version=version,
+            run_middleware=run_middleware,
+        )
 
     def http_app(
         self,
