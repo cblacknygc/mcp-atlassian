@@ -80,6 +80,9 @@ markers = [
     "cloud_e2e: mark test as requiring Cloud instances (Jira Cloud + Confluence Cloud)",
     "security_regression: SP5 security regression test (xfail-strict until the Phase B root fix lands; see plan)",
     "fastmcp4_smoke: FastMCP 4 dependency, import, and startup readiness",
+    "fastmcp4_compat: compatibility-only FastMCP 4 behavior; does not exercise policy parity",
+    "fastmcp4_policy: FastMCP 4 tool-policy security contract",
+    "fastmcp4_protocol: FastMCP 4 public MCP protocol contract",
 ]
 
 [tool.ruff]

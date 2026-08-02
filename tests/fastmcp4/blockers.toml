@@ -1,0 +1,13 @@
+[blockers.ENV-001]
+gate = "G0"
+description = "Production FastMCP-facing modules import and construct under FastMCP 4."
+tests = [
+    "tests/fastmcp4/test_import_startup.py::test_production_modules_import_and_construct",
+]
+
+[blockers.POL-001]
+gate = "G4"
+description = "A read-only-hidden write tool cannot be listed or called."
+tests = [
+    "tests/fastmcp4/test_tool_policy_contract.py::test_hidden_tool_cannot_be_called",
+]

@@ -232,11 +232,20 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
 
         Returns None when the lifespan context is unavailable.
         """
-        req_context = self._mcp_server.request_context
-        if req_context is None or req_context.lifespan_context is None:
-            return None
+        try:
+            from fastmcp.server.dependencies import get_context
 
-        lifespan_ctx_dict = req_context.lifespan_context
+            current_context = get_context()
+            req_context = current_context.request_context
+            lifespan_ctx_dict = current_context.lifespan_context
+        except RuntimeError:
+            # Direct unit calls do not establish FastMCP's request context.
+            req_context = getattr(self._mcp_server, "request_context", None)
+            if req_context is None or req_context.lifespan_context is None:
+                return None
+            lifespan_ctx_dict = req_context.lifespan_context
+        if not lifespan_ctx_dict:
+            return None
         app_lifespan_state: MainAppContext | None = (
             lifespan_ctx_dict.get("app_lifespan_context")
             if isinstance(lifespan_ctx_dict, dict)
@@ -327,6 +336,20 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
             ):
                 return False
         return True
+
+    async def list_tools(
+        self, *, run_middleware: bool = True
+    ) -> list[FastMCPTool]:
+        """List tools after applying mcp-atlassian's authorization policy."""
+        all_tools = list(await super().list_tools(run_middleware=run_middleware))
+        ctx = self._tool_filter_context()
+        if ctx is None:
+            return all_tools
+        return [
+            tool_obj
+            for tool_obj in all_tools
+            if self._is_tool_enabled(tool_obj.name, tool_obj, ctx)
+        ]
 
     async def _list_tools_mcp(self) -> list[MCPTool]:
         # Filter tools based on enabled_tools, read_only mode, and service configuration from the lifespan context.
