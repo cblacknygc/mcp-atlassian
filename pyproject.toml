@@ -10,14 +10,14 @@ dependencies = [
     "requests[socks]>=2.31.0",
     "beautifulsoup4>=4.12.3",
     "httpx>=0.28.0",
-    "mcp>=1.27.0,<2.0.0",
-    "fastmcp>=3.2.4,<4.0.0",
+    "mcp==2.0.0b2",
+    "fastmcp==4.0.0a2",
     "fakeredis>=2.32.1,<2.35.0",
     "python-dotenv>=1.0.1",
     "markdownify>=0.11.6",
     "markdown>=3.7.0",
     "markdown-to-confluence>=0.6.0,<0.7.0",
-    "pydantic>=2.10.6,<3.0",
+    "pydantic>=2.12.0,<3.0",
     "trio>=0.29.0",
     "click>=8.1.7",
     "uvicorn>=0.27.1",
@@ -64,6 +64,13 @@ dev = [
     "pyyaml>=6.0",
     "types-pyyaml>=6.0",
     "pypac>=0.17.2",
+    "tomli>=2.0.0",
+]
+
+[tool.uv]
+constraint-dependencies = [
+    "fastmcp-slim==4.0.0a2",
+    "mcp-types==2.0.0b2",
 ]
 
 [tool.pytest.ini_options]
@@ -72,6 +79,11 @@ markers = [
     "dc_e2e: mark test as requiring DC instances (Jira DC + Confluence DC)",
     "cloud_e2e: mark test as requiring Cloud instances (Jira Cloud + Confluence Cloud)",
     "security_regression: SP5 security regression test (xfail-strict until the Phase B root fix lands; see plan)",
+    "fastmcp4_smoke: FastMCP 4 dependency, import, and startup readiness",
+    "fastmcp4_compat: compatibility-only FastMCP 4 behavior; does not exercise policy parity",
+    "fastmcp4_policy: FastMCP 4 tool-policy security contract",
+    "fastmcp4_protocol: FastMCP 4 public MCP protocol contract",
+    "fastmcp4_upstream: FastMCP upstream-main readiness target",
 ]
 
 [tool.ruff]
