@@ -159,6 +159,18 @@ For mTLS, replace the personal token variables with client certificate variables
 | `MCP_ATLASSIAN_VALIDATION_CACHE_TTL` | Multi-user credential validation cache lifetime in seconds (`0` disables, default: `300`) |
 | `MCP_ATLASSIAN_VALIDATION_CACHE_MAXSIZE` | Maximum cached multi-user credential validations (default: `100`) |
 
+### Persisted OAuth Credential Settings
+
+| Variable | Description |
+|----------|-------------|
+| `ATLASSIAN_OAUTH_TOKEN_PROFILE` | Local persisted-token slot (default: `default`); use a distinct label for each Atlassian account |
+| `JIRA_OAUTH_TOKEN_PROFILE` | Jira-specific token profile; overrides `ATLASSIAN_OAUTH_TOKEN_PROFILE` |
+| `CONFLUENCE_OAUTH_TOKEN_PROFILE` | Confluence-specific token profile; overrides `ATLASSIAN_OAUTH_TOKEN_PROFILE` |
+
+The profile label is part of the persisted credential's storage identity. It is
+not an Atlassian-verified principal identifier and does not change OAuth scopes.
+Use the same profile during `--oauth-setup` and normal server startup.
+
 <Warning>
 Encrypted private keys are not supported. Setting `JIRA_CLIENT_KEY_PASSWORD` or
 `CONFLUENCE_CLIENT_KEY_PASSWORD` to a non-empty value will raise a configuration error

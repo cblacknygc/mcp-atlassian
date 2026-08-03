@@ -145,7 +145,24 @@ ATLASSIAN_OAUTH_CLIENT_ID=your_oauth_client_id
 ATLASSIAN_OAUTH_CLIENT_SECRET=your_oauth_client_secret
 ATLASSIAN_OAUTH_REDIRECT_URI=http://localhost:8080/callback
 ATLASSIAN_OAUTH_SCOPE=read:jira-work write:jira-work read:confluence-content.all write:confluence-content offline_access
+ATLASSIAN_OAUTH_TOKEN_PROFILE=default
 ```
+
+Persisted credentials are isolated by OAuth issuer, client ID, Atlassian Cloud ID
+or Data Center URL, canonical scope set, and token profile. A token profile is a
+local keyring/file slot, not an Atlassian-verified account name. If the same OAuth
+client is authorized by more than one account, choose a distinct profile while
+running `--oauth-setup`, then configure that same profile when starting the server.
+`JIRA_OAUTH_TOKEN_PROFILE` and `CONFLUENCE_OAUTH_TOKEN_PROFILE` override the shared
+profile for their respective service.
+
+<Note>
+Older persisted OAuth records do not include enough context to identify their
+scope or account safely. When one is detected, MCP Atlassian leaves it unchanged,
+does not load it, and asks you to run `mcp-atlassian --oauth-setup` once to create
+versioned scoped credentials. Cloud persisted-token loading also requires
+`ATLASSIAN_OAUTH_CLOUD_ID`.
+</Note>
 
 <Warning>
 Include `offline_access` in your scope to allow automatic token refresh.

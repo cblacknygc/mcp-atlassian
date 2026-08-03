@@ -190,6 +190,20 @@ Header values containing sensitive information are automatically masked in logs.
     2. Ensure your app has `offline_access` scope for refresh tokens
     3. Check if the OAuth app is still active in your Atlassian developer console
   </Accordion>
+  <Accordion title="Legacy or Missing Scoped OAuth Credentials">
+    **Cause:** A legacy persisted token was found without enough issuer, resource,
+    scope, or account context to reuse safely; or Cloud OAuth is missing
+    `ATLASSIAN_OAUTH_CLOUD_ID`.
+
+    **Fix:**
+    1. Set `ATLASSIAN_OAUTH_CLOUD_ID` for Cloud deployments
+    2. Set `ATLASSIAN_OAUTH_TOKEN_PROFILE` (default: `default`), using a distinct
+       label for each account that authorizes the same OAuth client
+    3. Re-run `mcp-atlassian --oauth-setup` to create a versioned scoped record
+
+    Legacy keyring entries and files are not loaded, changed, or deleted
+    automatically. Remove them manually only after confirming the new setup works.
+  </Accordion>
 </AccordionGroup>
 
 ## Field and Data Errors
