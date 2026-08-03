@@ -387,22 +387,11 @@ class TestTokenExpirationAndRetry:
             # Save tokens
             oauth_config._save_tokens()
 
-            # Verify keyring was called (may be called multiple times for
-            # cloud_id-specific and generic keys)
-            assert mock_set.call_count >= 1
-            # Check that at least one call stores the expected data
-            found_expected_call = False
-            for call_args in mock_set.call_args_list:
-                service_name, username, token_json = call_args[0]
-                if (
-                    service_name == "mcp-atlassian-oauth"
-                    and username == f"oauth-{client_id}"
-                ):
-                    found_expected_call = True
-                    break
-            assert found_expected_call, (
-                f"Expected keyring call with username='oauth-{client_id}'"
-            )
+            mock_set.assert_called_once()
+            service_name, username, token_json = mock_set.call_args.args
+            assert service_name == "mcp-atlassian-oauth"
+            assert username == oauth_config._get_keyring_username()
+            assert username.startswith("oauth-v2-")
 
             # Parse stored token data
             stored_data = json.loads(token_json)
@@ -412,7 +401,9 @@ class TestTokenExpirationAndRetry:
 
             # Test token retrieval
             mock_get.return_value = token_json
-            loaded_data = OAuthConfig.load_tokens(client_id)
+            loaded_data = OAuthConfig.load_tokens(
+                client_id, "read:jira", cloud_id="test-cloud"
+            )
             assert loaded_data["access_token"] == "stored-token"
             assert loaded_data["refresh_token"] == "stored-refresh"
 

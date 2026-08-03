@@ -145,6 +145,7 @@ class TestOAuthFlow:
                 mock_config.redirect_uri = "http://localhost:8080/callback"
                 mock_config.scope = "read:jira-work"
                 mock_config.cloud_id = "test-cloud-id"
+                mock_config.token_profile = "default"
                 mock_config.access_token = "test-access-token"
                 mock_config.refresh_token = "test-refresh-token"
                 mock_oauth_config.return_value = mock_config
@@ -195,6 +196,7 @@ class TestOAuthFlow:
                 mock_config.redirect_uri = "https://example.com/callback"
                 mock_config.scope = "read:jira-work"
                 mock_config.cloud_id = "test-cloud-id"
+                mock_config.token_profile = "default"
                 mock_config.access_token = "test-access-token"
                 mock_config.refresh_token = "test-refresh-token"
                 mock_oauth_config.return_value = mock_config
@@ -302,7 +304,7 @@ class TestInteractiveSetup(BaseAuthTest):
         """Test interactive setup using environment variables."""
         with MockEnvironment.oauth_env() as env_vars:
             with (
-                patch("builtins.input", side_effect=["", "", "", ""]),
+                patch("builtins.input", side_effect=["", "", "", "", ""]),
                 patch(
                     "mcp_atlassian.utils.oauth_setup.run_oauth_flow", return_value=True
                 ) as mock_flow,
@@ -327,11 +329,12 @@ class TestInteractiveSetup(BaseAuthTest):
                     "user-secret",
                     "http://localhost:9000/callback",
                     "read:jira-work",
+                    "work-account",
                 ],
                 0,
             ),
-            (["", "client-secret", "", ""], 1),  # Missing client ID
-            (["client-id", "", "", ""], 1),  # Missing client secret
+            (["", "client-secret", "", "", ""], 1),  # Missing client ID
+            (["client-id", "", "", "", ""], 1),  # Missing client secret
         ],
     )
     def test_run_oauth_setup_user_input(self, input_values, expected_result):
@@ -356,7 +359,8 @@ class TestInteractiveSetup(BaseAuthTest):
         with MockEnvironment.clean_env():
             with (
                 patch(
-                    "builtins.input", side_effect=["client-id", "client-secret", "", ""]
+                    "builtins.input",
+                    side_effect=["client-id", "client-secret", "", "", ""],
                 ),
                 patch(
                     "mcp_atlassian.utils.oauth_setup.run_oauth_flow", return_value=False
@@ -383,6 +387,7 @@ class TestOAuthSetupArgs:
             "client_secret": "test-secret",
             "redirect_uri": "http://localhost:8080/callback",
             "scope": "read:jira-work",
+            "token_profile": "default",
         }
         assert_config_contains(vars(args), **expected_config)
 

@@ -13,7 +13,9 @@ from mcp_atlassian.utils.oauth import (
     CLOUD_TOKEN_URL,
     DC_AUTHORIZE_PATH,
     DC_TOKEN_PATH,
+    DEFAULT_TOKEN_PROFILE,
     KEYRING_SERVICE_NAME,
+    OAUTH_STORAGE_VERSION,
     TOKEN_EXPIRY_MARGIN,
     BYOAccessTokenOAuthConfig,
     OAuthConfig,
@@ -327,17 +329,20 @@ class TestOAuthConfig:
         assert config.cloud_id is None
 
     def test_get_keyring_username(self):
-        """Test _get_keyring_username method."""
+        """The keyring username is a fixed-length v2 identity digest."""
         config = OAuthConfig(
             client_id="test-client-id",
             client_secret="test-client-secret",
             redirect_uri="https://example.com/callback",
             scope="read:jira-work write:jira-work",
+            cloud_id="test-cloud-id",
         )
         username = config._get_keyring_username()
 
-        # Check the keyring username format
-        assert username == "oauth-test-client-id"
+        assert username.startswith(f"oauth-v{OAUTH_STORAGE_VERSION}-")
+        assert len(username) == len(f"oauth-v{OAUTH_STORAGE_VERSION}-") + 64
+        assert "test-client-id" not in username
+        assert "test-cloud-id" not in username
 
     @patch("keyring.set_password")
     @patch.object(OAuthConfig, "_save_tokens_to_file")
@@ -355,24 +360,15 @@ class TestOAuthConfig:
         )
         config._save_tokens()
 
-        # Verify keyring was used - should be called twice:
-        # 1. For context-specific key (oauth-{client_id}-cloud-{cloud_id})
-        # 2. For base key (oauth-{client_id}) for load_tokens() compatibility
-        assert mock_set_password.call_count == 2
-
-        # Check first call (context-specific key)
-        first_call = mock_set_password.call_args_list[0]
-        assert first_call[0][0] == KEYRING_SERVICE_NAME
-        assert first_call[0][1] == "oauth-test-client-id-cloud-test-cloud-id"
-        assert "test-refresh-token" in first_call[0][2]
-        assert "test-access-token" in first_call[0][2]
-
-        # Check second call (base key for load_tokens() compatibility)
-        second_call = mock_set_password.call_args_list[1]
-        assert second_call[0][0] == KEYRING_SERVICE_NAME
-        assert second_call[0][1] == "oauth-test-client-id"
-        assert "test-refresh-token" in second_call[0][2]
-        assert "test-access-token" in second_call[0][2]
+        mock_set_password.assert_called_once()
+        service, username, token_json = mock_set_password.call_args.args
+        assert service == KEYRING_SERVICE_NAME
+        assert username == config._get_keyring_username()
+        assert username.startswith(f"oauth-v{OAUTH_STORAGE_VERSION}-")
+        token_data = json.loads(token_json)
+        assert token_data["refresh_token"] == "test-refresh-token"
+        assert token_data["access_token"] == "test-access-token"
+        assert token_data["storage_identity"]["resource"] == "test-cloud-id"
 
         # Verify file backup was created
         mock_save_to_file.assert_called_once()
@@ -393,24 +389,14 @@ class TestOAuthConfig:
         )
         config._save_tokens()
 
-        # Verify keyring was used - should be called twice:
-        # 1. For context-specific key (oauth-{client_id}-dc-{url_hash})
-        # 2. For base key (oauth-{client_id}) for load_tokens() compatibility
-        assert mock_set_password.call_count == 2
-
-        # Check first call (context-specific DC key)
-        first_call = mock_set_password.call_args_list[0]
-        assert first_call[0][0] == KEYRING_SERVICE_NAME
-        assert first_call[0][1].startswith("oauth-test-client-id-dc-")
-        assert "test-refresh-token" in first_call[0][2]
-        assert "test-access-token" in first_call[0][2]
-
-        # Check second call (base key for load_tokens() compatibility)
-        second_call = mock_set_password.call_args_list[1]
-        assert second_call[0][0] == KEYRING_SERVICE_NAME
-        assert second_call[0][1] == "oauth-test-client-id"
-        assert "test-refresh-token" in second_call[0][2]
-        assert "test-access-token" in second_call[0][2]
+        mock_set_password.assert_called_once()
+        service, username, token_json = mock_set_password.call_args.args
+        assert service == KEYRING_SERVICE_NAME
+        assert username == config._get_keyring_username()
+        token_data = json.loads(token_json)
+        assert token_data["refresh_token"] == "test-refresh-token"
+        assert token_data["access_token"] == "test-access-token"
+        assert token_data["storage_identity"]["issuer"] == ("https://jira.example.com")
 
         # Verify file backup was created
         mock_save_to_file.assert_called_once()
@@ -455,7 +441,9 @@ class TestOAuthConfig:
         with patch("mcp_atlassian.utils.oauth.Path.home", return_value=tmp_path):
             config._save_tokens_to_file()
 
-        token_path = tmp_path / ".mcp-atlassian" / "oauth-test-client-id.json"
+        token_path = (
+            tmp_path / ".mcp-atlassian" / f"{config._get_keyring_username()}.json"
+        )
         assert token_path.exists()
         saved_data = json.loads(token_path.read_text())
         assert saved_data["refresh_token"] == "test-refresh-token"
@@ -467,8 +455,13 @@ class TestOAuthConfig:
     @patch.object(OAuthConfig, "_load_tokens_from_file")
     def test_load_tokens_keyring_success(self, mock_load_from_file, mock_get_password):
         """Test load_tokens with successful keyring retrieval."""
-        # Setup keyring to return token data
+        identity = OAuthConfig._storage_identity(
+            "test-client-id",
+            "read:jira-work",
+            cloud_id="keyring-cloud-id",
+        )
         token_data = {
+            "storage_identity": identity,
             "refresh_token": "keyring-refresh-token",
             "access_token": "keyring-access-token",
             "expires_at": 1234567890,
@@ -476,11 +469,15 @@ class TestOAuthConfig:
         }
         mock_get_password.return_value = json.dumps(token_data)
 
-        result = OAuthConfig.load_tokens("test-client-id")
+        result = OAuthConfig.load_tokens(
+            "test-client-id",
+            "read:jira-work",
+            cloud_id="keyring-cloud-id",
+        )
 
         # Should have used keyring
         mock_get_password.assert_called_once_with(
-            KEYRING_SERVICE_NAME, "oauth-test-client-id"
+            KEYRING_SERVICE_NAME, OAuthConfig._storage_username(identity)
         )
 
         # Should not fall back to file
@@ -508,13 +505,18 @@ class TestOAuthConfig:
         }
         mock_load_from_file.return_value = file_token_data
 
-        result = OAuthConfig.load_tokens("test-client-id")
+        identity = OAuthConfig._storage_identity(
+            "test-client-id", "read:jira-work", cloud_id="file-cloud-id"
+        )
+        result = OAuthConfig.load_tokens(
+            "test-client-id", "read:jira-work", cloud_id="file-cloud-id"
+        )
 
         # Should have tried keyring
         mock_get_password.assert_called_once()
 
         # Should have fallen back to file
-        mock_load_from_file.assert_called_once_with("test-client-id")
+        mock_load_from_file.assert_called_once_with(identity)
 
         # Check result contains file data
         assert result["refresh_token"] == "file-refresh-token"
@@ -537,13 +539,18 @@ class TestOAuthConfig:
         }
         mock_load_from_file.return_value = file_token_data
 
-        result = OAuthConfig.load_tokens("test-client-id")
+        identity = OAuthConfig._storage_identity(
+            "test-client-id", "read:jira-work", cloud_id="file-cloud-id"
+        )
+        result = OAuthConfig.load_tokens(
+            "test-client-id", "read:jira-work", cloud_id="file-cloud-id"
+        )
 
         # Should have tried keyring
         mock_get_password.assert_called_once()
 
         # Should have fallen back to file
-        mock_load_from_file.assert_called_once_with("test-client-id")
+        mock_load_from_file.assert_called_once_with(identity)
 
         # Check result contains file data
         assert result["refresh_token"] == "file-refresh-token"
@@ -555,7 +562,11 @@ class TestOAuthConfig:
     def test_load_tokens_from_file_success(self, mock_load, mock_exists):
         """Test _load_tokens_from_file success case."""
         mock_exists.return_value = True
+        identity = OAuthConfig._storage_identity(
+            "test-client-id", "read:jira-work", cloud_id="test-cloud-id"
+        )
         mock_load.return_value = {
+            "storage_identity": identity,
             "refresh_token": "test-refresh-token",
             "access_token": "test-access-token",
             "expires_at": 1234567890,
@@ -565,7 +576,7 @@ class TestOAuthConfig:
         # Mock open
         mock_open = MagicMock()
         with patch("builtins.open", mock_open):
-            result = OAuthConfig._load_tokens_from_file("test-client-id")
+            result = OAuthConfig._load_tokens_from_file(identity)
 
             # Check result
             assert result["refresh_token"] == "test-refresh-token"
@@ -578,7 +589,10 @@ class TestOAuthConfig:
         """Test _load_tokens_from_file when file doesn't exist."""
         mock_exists.return_value = False
 
-        result = OAuthConfig._load_tokens_from_file("test-client-id")
+        identity = OAuthConfig._storage_identity(
+            "test-client-id", "read:jira-work", cloud_id="test-cloud-id"
+        )
+        result = OAuthConfig._load_tokens_from_file(identity)
 
         # Should return empty dict
         assert result == {}
@@ -989,27 +1003,28 @@ class TestDataCenterOAuth:
     # --- Keyring username namespacing ---
 
     def test_keyring_username_dc(self):
-        """DC config keyring username includes dc-{url_hash}."""
+        """DC config keyring username is a versioned identity digest."""
         config = self._make_dc_config()
         username = config._get_keyring_username()
-        assert username.startswith("oauth-dc-client-dc-")
-        assert len(username) > len("oauth-dc-client-dc-")
+        assert username.startswith(f"oauth-v{OAUTH_STORAGE_VERSION}-")
+        assert len(username) == len(f"oauth-v{OAUTH_STORAGE_VERSION}-") + 64
 
     def test_keyring_username_cloud(self):
-        """Cloud config keyring username includes cloud-{cloud_id}."""
+        """Cloud config keyring username is a versioned identity digest."""
         config = self._make_cloud_config()
         username = config._get_keyring_username()
-        assert username == "oauth-cloud-client-cloud-cloud-123"
+        assert username.startswith(f"oauth-v{OAUTH_STORAGE_VERSION}-")
 
     def test_keyring_username_no_context(self):
-        """Config without cloud_id or base_url uses simple format."""
+        """Config without cloud_id or base_url cannot select persistent state."""
         config = OAuthConfig(
             client_id="orphan",
             client_secret="s",
             redirect_uri="r",
             scope="sc",
         )
-        assert config._get_keyring_username() == "oauth-orphan"
+        with pytest.raises(ValueError, match="Cloud ID or Data Center base URL"):
+            config._get_keyring_username()
 
     # --- authorization URL ---
 
@@ -1249,10 +1264,380 @@ class TestTokenFilePermissionsRegression:
         finally:
             os.umask(old_umask)
 
-        token_path = tmp_path / ".mcp-atlassian" / "oauth-test-client-id.json"
+        token_path = (
+            tmp_path / ".mcp-atlassian" / f"{config._get_keyring_username()}.json"
+        )
         assert token_path.exists(), "token file was not written"
         mode = stat.S_IMODE(token_path.stat().st_mode)
         assert mode & 0o077 == 0, (
             "OAuth token file must not be group/world-readable (expected 0o600); "
             f"got {oct(mode)}"
         )
+
+
+class TestOAuthCredentialScoping:
+    """Regression coverage for persisted OAuth credential isolation."""
+
+    @staticmethod
+    def _token_data(
+        identity: dict[str, object],
+        *,
+        access_token: str = "access-a",
+        refresh_token: str = "refresh-a",
+    ) -> dict[str, object]:
+        """Build fake persisted data bound to an identity."""
+        return {
+            "storage_identity": identity,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": 1234567890,
+        }
+
+    @pytest.mark.security_regression
+    def test_same_client_id_cannot_cross_data_center_instances(self, tmp_path) -> None:
+        """A token saved for DC-A is unavailable at DC-B and is never refreshed."""
+        stored: dict[tuple[str, str], str] = {}
+
+        def set_password(service: str, username: str, value: str) -> None:
+            stored[(service, username)] = value
+
+        def get_password(service: str, username: str) -> str | None:
+            return stored.get((service, username))
+
+        dc_a = OAuthConfig(
+            client_id="shared-client",
+            client_secret="secret",
+            redirect_uri="http://localhost/callback",
+            scope="WRITE",
+            base_url="https://jira-a.example",
+            access_token="access-a",
+            refresh_token="refresh-a",
+        )
+        with (
+            patch("keyring.set_password", side_effect=set_password),
+            patch.object(OAuthConfig, "_save_tokens_to_file"),
+        ):
+            dc_a._save_tokens()
+
+        with (
+            patch("keyring.get_password", side_effect=get_password),
+            patch("mcp_atlassian.utils.oauth.Path.home", return_value=tmp_path),
+        ):
+            loaded_for_b = OAuthConfig.load_tokens(
+                "shared-client", "WRITE", base_url="https://jira-b.example"
+            )
+
+        dc_b = OAuthConfig(
+            client_id="shared-client",
+            client_secret="secret",
+            redirect_uri="http://localhost/callback",
+            scope="WRITE",
+            base_url="https://jira-b.example",
+            refresh_token=loaded_for_b.get("refresh_token"),
+            access_token=loaded_for_b.get("access_token"),
+        )
+        with patch("mcp_atlassian.utils.oauth.requests.post") as post:
+            assert dc_b.ensure_valid_token() is False
+
+        assert loaded_for_b == {}
+        post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "first,second",
+        [
+            (
+                {"cloud_id": "cloud-a"},
+                {"base_url": "https://jira.example"},
+            ),
+            ({"cloud_id": "cloud-a"}, {"cloud_id": "cloud-b"}),
+            (
+                {"base_url": "https://jira-a.example"},
+                {"base_url": "https://jira-b.example"},
+            ),
+        ],
+    )
+    def test_resource_contexts_have_distinct_storage_keys(
+        self, first: dict[str, str], second: dict[str, str]
+    ) -> None:
+        """Cloud/DC, Cloud tenants, and DC instances never share a key."""
+        first_identity = OAuthConfig._storage_identity(
+            "shared-client", "read:jira", **first
+        )
+        second_identity = OAuthConfig._storage_identity(
+            "shared-client", "read:jira", **second
+        )
+        assert OAuthConfig._storage_username(first_identity) != (
+            OAuthConfig._storage_username(second_identity)
+        )
+
+    def test_scope_sets_are_canonical_and_case_sensitive(self) -> None:
+        """Equivalent scope sets collide intentionally; distinct case does not."""
+        ordered = OAuthConfig._storage_identity(
+            "client", "read:jira write:jira", cloud_id="cloud"
+        )
+        reordered = OAuthConfig._storage_identity(
+            "client", "write:jira,read:jira read:jira", cloud_id="cloud"
+        )
+        different = OAuthConfig._storage_identity(
+            "client", "read:jira", cloud_id="cloud"
+        )
+        different_case = OAuthConfig._storage_identity(
+            "client", "READ:jira write:jira", cloud_id="cloud"
+        )
+
+        assert ordered == reordered
+        assert ordered != different
+        assert ordered != different_case
+
+    def test_opaque_client_and_cloud_ids_are_not_normalized(self) -> None:
+        """Whitespace remains significant for opaque IDs used by OAuth requests."""
+        plain = OAuthConfig._storage_identity("client", "read:jira", cloud_id="cloud")
+        padded_client = OAuthConfig._storage_identity(
+            " client", "read:jira", cloud_id="cloud"
+        )
+        padded_cloud = OAuthConfig._storage_identity(
+            "client", "read:jira", cloud_id="cloud "
+        )
+        assert plain != padded_client
+        assert plain != padded_cloud
+
+    def test_token_profiles_separate_local_principals(self) -> None:
+        """Profiles select separate token slots for otherwise equal contexts."""
+        work = OAuthConfig._storage_identity(
+            "client", "read:jira", cloud_id="cloud", token_profile="work"
+        )
+        admin = OAuthConfig._storage_identity(
+            "client", "read:jira", cloud_id="cloud", token_profile="admin"
+        )
+        assert OAuthConfig._storage_username(work) != (
+            OAuthConfig._storage_username(admin)
+        )
+
+    def test_service_token_profile_overrides_shared_profile(self) -> None:
+        """A service-specific profile takes precedence over the shared value."""
+        env = {
+            "ATLASSIAN_OAUTH_CLIENT_ID": "client",
+            "ATLASSIAN_OAUTH_CLIENT_SECRET": "secret",
+            "ATLASSIAN_OAUTH_REDIRECT_URI": "https://example/callback",
+            "ATLASSIAN_OAUTH_SCOPE": "read:jira",
+            "ATLASSIAN_OAUTH_CLOUD_ID": "cloud",
+            "ATLASSIAN_OAUTH_TOKEN_PROFILE": "shared",
+            "JIRA_OAUTH_TOKEN_PROFILE": "jira-work",
+        }
+        with (
+            patch.dict("os.environ", env, clear=True),
+            patch.object(OAuthConfig, "load_tokens", return_value={}) as load,
+        ):
+            config = OAuthConfig.from_env(
+                service_url="https://example.atlassian.net", service_type="jira"
+            )
+
+        assert config is not None
+        assert config.token_profile == "jira-work"
+        assert load.call_args.kwargs["token_profile"] == "jira-work"
+
+    @pytest.mark.parametrize(
+        "left,right",
+        [
+            ("HTTPS://JIRA.EXAMPLE:443/", "https://jira.example"),
+            ("http://JIRA.EXAMPLE:80/team/", "http://jira.example/team"),
+        ],
+    )
+    def test_equivalent_dc_urls_share_identity(self, left: str, right: str) -> None:
+        """Scheme/host case, default ports, and trailing slash normalize."""
+        assert OAuthConfig._canonical_base_url(left) == (
+            OAuthConfig._canonical_base_url(right)
+        )
+
+    @pytest.mark.parametrize(
+        "left,right",
+        [
+            ("https://jira.example", "https://jira.example:8443"),
+            ("https://jira.example/team-a", "https://jira.example/team-b"),
+        ],
+    )
+    def test_distinct_dc_urls_remain_separate(self, left: str, right: str) -> None:
+        """Non-default ports and meaningful deployment paths remain distinct."""
+        assert OAuthConfig._canonical_base_url(left) != (
+            OAuthConfig._canonical_base_url(right)
+        )
+
+    @pytest.mark.parametrize(
+        "scope,cloud_id,base_url",
+        [
+            ("read:jira", None, None),
+            ("", "cloud", None),
+        ],
+    )
+    def test_incomplete_identity_is_not_persisted(
+        self,
+        scope: str,
+        cloud_id: str | None,
+        base_url: str | None,
+        caplog,
+    ) -> None:
+        """Incomplete identity retains in-memory tokens but writes no storage."""
+        config = OAuthConfig(
+            client_id="client",
+            client_secret="secret-value",
+            redirect_uri="https://example/callback",
+            scope=scope,
+            cloud_id=cloud_id,
+            base_url=base_url,
+            access_token="access-value",
+            refresh_token="refresh-value",
+        )
+        with (
+            patch("keyring.set_password") as set_password,
+            patch.object(OAuthConfig, "_save_tokens_to_file") as save_file,
+            caplog.at_level("WARNING", logger="mcp-atlassian.oauth"),
+        ):
+            config._save_tokens()
+
+        set_password.assert_not_called()
+        save_file.assert_not_called()
+        assert config.access_token == "access-value"
+        assert "not persisted" in caplog.text
+        assert "access-value" not in caplog.text
+        assert "refresh-value" not in caplog.text
+        assert "secret-value" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "stored_identity",
+        [
+            None,
+            {"version": 1},
+            {
+                "version": OAUTH_STORAGE_VERSION,
+                "issuer": "https://auth.atlassian.com",
+                "client_id": "client",
+                "resource": "other-cloud",
+                "scopes": ["read:jira"],
+                "profile": DEFAULT_TOKEN_PROFILE,
+            },
+            {
+                "version": float(OAUTH_STORAGE_VERSION),
+                "issuer": "https://auth.atlassian.com",
+                "client_id": "client",
+                "resource": "expected-cloud",
+                "scopes": ["read:jira"],
+                "profile": DEFAULT_TOKEN_PROFILE,
+            },
+        ],
+    )
+    def test_invalid_or_mismatched_metadata_is_rejected(
+        self, stored_identity: dict[str, object] | None, tmp_path, caplog
+    ) -> None:
+        """Missing, wrong-version, and mismatched metadata are cache misses."""
+        stored_data = {
+            "storage_identity": stored_identity,
+            "access_token": "should-not-load-access",
+            "refresh_token": "should-not-load-refresh",
+        }
+        with (
+            patch("keyring.get_password", return_value=json.dumps(stored_data)),
+            patch("mcp_atlassian.utils.oauth.Path.home", return_value=tmp_path),
+            caplog.at_level("WARNING", logger="mcp-atlassian.oauth"),
+        ):
+            loaded = OAuthConfig.load_tokens(
+                "client", "read:jira", cloud_id="expected-cloud"
+            )
+
+        assert loaded == {}
+        assert "mismatched identity metadata" in caplog.text
+        assert "should-not-load-access" not in caplog.text
+        assert "should-not-load-refresh" not in caplog.text
+
+    def test_malformed_keyring_json_is_rejected(self, tmp_path, caplog) -> None:
+        """Malformed v2 data falls back safely without logging its contents."""
+        malformed = "not-json-secret-marker"
+        with (
+            patch("keyring.get_password", return_value=malformed),
+            patch("mcp_atlassian.utils.oauth.Path.home", return_value=tmp_path),
+            caplog.at_level("WARNING", logger="mcp-atlassian.oauth"),
+        ):
+            loaded = OAuthConfig.load_tokens("client", "read:jira", cloud_id="cloud")
+
+        assert loaded == {}
+        assert malformed not in caplog.text
+
+    def test_legacy_records_warn_but_are_not_consumed_or_modified(
+        self, tmp_path, caplog
+    ) -> None:
+        """Legacy keys/files trigger reauthorization guidance only."""
+        token_dir = tmp_path / ".mcp-atlassian"
+        token_dir.mkdir()
+        legacy_file = token_dir / "oauth-client.json"
+        original = b'{"refresh_token":"legacy-file-refresh"}'
+        legacy_file.write_bytes(original)
+
+        def get_password(service: str, username: str) -> str | None:
+            if service == KEYRING_SERVICE_NAME and username in {
+                "oauth-client",
+                "oauth-client-cloud-cloud",
+            }:
+                return '{"refresh_token":"legacy-keyring-refresh"}'
+            return None
+
+        with (
+            patch("keyring.get_password", side_effect=get_password),
+            patch("keyring.set_password") as set_password,
+            patch("mcp_atlassian.utils.oauth.Path.home", return_value=tmp_path),
+            caplog.at_level("WARNING", logger="mcp-atlassian.oauth"),
+        ):
+            loaded = OAuthConfig.load_tokens("client", "read:jira", cloud_id="cloud")
+
+        assert loaded == {}
+        assert legacy_file.read_bytes() == original
+        assert legacy_file.exists()
+        set_password.assert_not_called()
+        assert "Legacy OAuth tokens were detected" in caplog.text
+        assert "legacy-file-refresh" not in caplog.text
+        assert "legacy-keyring-refresh" not in caplog.text
+
+    def test_refresh_rotation_updates_only_matching_v2_record(self) -> None:
+        """A rotated refresh token overwrites only its exact credential slot."""
+        config = OAuthConfig(
+            client_id="client",
+            client_secret="secret",
+            redirect_uri="https://example/callback",
+            scope="read:jira",
+            cloud_id="cloud",
+            access_token="old-access",
+            refresh_token="old-refresh",
+        )
+        response = MagicMock()
+        response.json.return_value = {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }
+        with (
+            patch("mcp_atlassian.utils.oauth.requests.post", return_value=response),
+            patch("keyring.set_password") as set_password,
+            patch.object(OAuthConfig, "_save_tokens_to_file") as save_file,
+        ):
+            assert config.refresh_access_token() is True
+
+        set_password.assert_called_once()
+        service, username, value = set_password.call_args.args
+        assert service == KEYRING_SERVICE_NAME
+        assert username == config._get_keyring_username()
+        assert json.loads(value)["refresh_token"] == "new-refresh"
+        save_file.assert_called_once()
+
+    def test_byo_access_token_behavior_is_unchanged(self) -> None:
+        """Request-provided bearer tokens remain outside persistent storage."""
+        config = BYOAccessTokenOAuthConfig(
+            access_token="request-token", cloud_id="cloud"
+        )
+        session = requests.Session()
+        with (
+            patch("keyring.get_password") as get_password,
+            patch("keyring.set_password") as set_password,
+        ):
+            assert configure_oauth_session(session, config) is True
+
+        assert session.headers["Authorization"] == "Bearer request-token"
+        get_password.assert_not_called()
+        set_password.assert_not_called()
