@@ -15,7 +15,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import keyring
 import requests
@@ -47,6 +47,9 @@ HTTP_CONNECT_TIMEOUT = 5
 HTTP_READ_TIMEOUT = 20
 HTTP_TIMEOUT = (HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
 KEYRING_SERVICE_NAME = "mcp-atlassian-oauth"
+OAUTH_STORAGE_VERSION = 2
+CLOUD_ISSUER = "https://auth.atlassian.com"
+DEFAULT_TOKEN_PROFILE = "default"  # noqa: S105 - profile label, not a secret
 
 
 @dataclass
@@ -69,9 +72,11 @@ class OAuthConfig:
     refresh_token: str | None = None
     access_token: str | None = None
     expires_at: float | None = None
+    token_profile: str = DEFAULT_TOKEN_PROFILE
 
     def __post_init__(self) -> None:
         """Validate mutual exclusivity of cloud_id and base_url."""
+        self.token_profile = self.token_profile.strip() or DEFAULT_TOKEN_PROFILE
         if self.cloud_id and self.base_url:
             # Check if base_url is a Cloud URL — if so, cloud_id takes precedence
             if is_atlassian_cloud_url(self.base_url):
@@ -332,21 +337,111 @@ class OAuthConfig:
         except Exception as e:
             logger.error(f"Failed to get cloud ID: {e}")
 
+    @staticmethod
+    def _canonical_scopes(scope: str) -> tuple[str, ...]:
+        """Return a stable, case-sensitive OAuth scope set."""
+        return tuple(sorted(set(scope.replace(",", " ").split())))
+
+    @staticmethod
+    def _canonical_base_url(base_url: str) -> str:
+        """Canonicalize a Data Center base URL without collapsing its path."""
+        parsed = urllib.parse.urlsplit(base_url.strip())
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname.lower() if parsed.hostname else ""
+        if scheme not in {"http", "https"} or not hostname:
+            raise ValueError("Data Center OAuth requires an HTTP(S) base URL")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError(
+                "Data Center OAuth base URL cannot contain credentials, "
+                "query, or fragment"
+            )
+
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("Data Center OAuth base URL has an invalid port") from exc
+
+        host_for_url = f"[{hostname}]" if ":" in hostname else hostname
+        default_port = (scheme == "http" and port == 80) or (
+            scheme == "https" and port == 443
+        )
+        netloc = (
+            host_for_url if port is None or default_port else f"{host_for_url}:{port}"
+        )
+        path = parsed.path.rstrip("/")
+        return urllib.parse.urlunsplit((scheme, netloc, path, "", ""))
+
+    @classmethod
+    def _storage_identity(
+        cls,
+        client_id: str,
+        scope: str,
+        *,
+        cloud_id: str | None = None,
+        base_url: str | None = None,
+        token_profile: str = DEFAULT_TOKEN_PROFILE,
+    ) -> dict[str, Any]:
+        """Build the complete identity for one persisted OAuth credential."""
+        normalized_client_id = client_id
+        scopes = cls._canonical_scopes(scope)
+        profile = token_profile.strip() or DEFAULT_TOKEN_PROFILE
+        if not normalized_client_id.strip():
+            raise ValueError("OAuth token persistence requires a client ID")
+        if not scopes:
+            raise ValueError("OAuth token persistence requires at least one scope")
+        if cloud_id and base_url:
+            raise ValueError("OAuth token persistence requires one resource context")
+
+        if base_url:
+            resource = cls._canonical_base_url(base_url)
+            issuer = resource
+        elif cloud_id and cloud_id.strip():
+            resource = cloud_id
+            issuer = CLOUD_ISSUER
+        else:
+            raise ValueError(
+                "OAuth token persistence requires a Cloud ID or Data Center base URL"
+            )
+
+        return {
+            "version": OAUTH_STORAGE_VERSION,
+            "issuer": issuer,
+            "client_id": normalized_client_id,
+            "resource": resource,
+            "scopes": list(scopes),
+            "profile": profile,
+        }
+
+    @staticmethod
+    def _storage_username(identity: dict[str, Any]) -> str:
+        """Return a fixed-length keyring and file identifier for an identity."""
+        identity_json = json.dumps(
+            identity, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        )
+        digest = hashlib.sha256(identity_json.encode()).hexdigest()
+        return f"oauth-v{OAUTH_STORAGE_VERSION}-{digest}"
+
     def _get_keyring_username(self) -> str:
-        """Get the keyring username for storing tokens.
+        """Get the versioned keyring username for this OAuth configuration."""
+        identity = self._storage_identity(
+            self.client_id,
+            self.scope,
+            cloud_id=self.cloud_id,
+            base_url=self.base_url,
+            token_profile=self.token_profile,
+        )
+        return self._storage_username(identity)
 
-        Includes context (cloud_id or base_url hash) to prevent collisions
-        when the same client_id is used across Cloud and Data Center.
-
-        Returns:
-            A username string for keyring
-        """
-        if self.is_data_center and self.base_url:
-            url_hash = hashlib.sha256(self.base_url.encode()).hexdigest()[:8]
-            return f"oauth-{self.client_id}-dc-{url_hash}"
-        if self.cloud_id:
-            return f"oauth-{self.client_id}-cloud-{self.cloud_id}"
-        return f"oauth-{self.client_id}"
+    def _token_data(self, identity: dict[str, Any]) -> dict[str, Any]:
+        """Return versioned token data bound to its complete storage identity."""
+        return {
+            "storage_identity": identity,
+            "refresh_token": self.refresh_token,
+            "access_token": self.access_token,
+            "expires_at": self.expires_at,
+            "cloud_id": self.cloud_id,
+            "base_url": self.base_url,
+        }
 
     def _save_tokens(self) -> None:
         """Save the tokens securely using keyring for later use.
@@ -355,40 +450,27 @@ class OAuthConfig:
         the user to go through the authorization flow again.
         """
         try:
-            username = self._get_keyring_username()
-            base_username = f"oauth-{self.client_id}"
+            identity = self._storage_identity(
+                self.client_id,
+                self.scope,
+                cloud_id=self.cloud_id,
+                base_url=self.base_url,
+                token_profile=self.token_profile,
+            )
+        except ValueError as exc:
+            logger.warning("OAuth tokens were not persisted: %s", exc)
+            return
 
-            # Store token data as JSON string in keyring
-            token_data = {
-                "refresh_token": self.refresh_token,
-                "access_token": self.access_token,
-                "expires_at": self.expires_at,
-                "cloud_id": self.cloud_id,
-                "base_url": self.base_url,
-            }
-
+        username = self._storage_username(identity)
+        token_data = self._token_data(identity)
+        try:
             token_json = json.dumps(token_data)
-
-            # Store the token data in the system keyring using context-specific key
             keyring.set_password(KEYRING_SERVICE_NAME, username, token_json)
             logger.debug(f"Saved OAuth tokens to keyring for {username}")
-
-            # Also save to base username for compatibility with load_tokens()
-            # which uses the simpler oauth-{client_id} pattern.
-            # Note: If the same client_id is used for both Cloud and DC (rare),
-            # the base key will be overwritten by whichever saves last.
-            if username != base_username:
-                keyring.set_password(KEYRING_SERVICE_NAME, base_username, token_json)
-                logger.debug(f"Saved OAuth tokens to keyring for {base_username}")
-
-            # Also maintain backwards compatibility with file storage
-            # for environments where keyring might not work
             self._save_tokens_to_file(token_data)
-
         except Exception as e:
             logger.error(f"Failed to save tokens to keyring: {e}")
-            # Fall back to file storage if keyring fails
-            self._save_tokens_to_file()
+            self._save_tokens_to_file(token_data)
 
     def _save_tokens_to_file(self, token_data: dict | None = None) -> None:
         """Save the tokens to a file as fallback storage.
@@ -403,17 +485,22 @@ class OAuthConfig:
             token_dir.mkdir(exist_ok=True)
             os.chmod(token_dir, 0o700)
 
-            # Save the tokens to a file
-            token_path = token_dir / f"oauth-{self.client_id}.json"
-
             if token_data is None:
-                token_data = {
-                    "refresh_token": self.refresh_token,
-                    "access_token": self.access_token,
-                    "expires_at": self.expires_at,
-                    "cloud_id": self.cloud_id,
-                    "base_url": self.base_url,
-                }
+                identity = self._storage_identity(
+                    self.client_id,
+                    self.scope,
+                    cloud_id=self.cloud_id,
+                    base_url=self.base_url,
+                    token_profile=self.token_profile,
+                )
+                token_data = self._token_data(identity)
+            else:
+                stored_identity = token_data.get("storage_identity")
+                if not isinstance(stored_identity, dict):
+                    raise ValueError("OAuth token data is missing its storage identity")
+                identity = stored_identity
+
+            token_path = token_dir / f"{self._storage_username(identity)}.json"
 
             # Persisted tokens are secrets: create/truncate owner-only so they are
             # never group/world-readable, independent of the process umask.
@@ -426,43 +513,97 @@ class OAuthConfig:
         except Exception as e:
             logger.error(f"Failed to save tokens to file: {e}")
 
-    @staticmethod
-    def load_tokens(client_id: str) -> dict[str, Any]:
+    @classmethod
+    def load_tokens(
+        cls,
+        client_id: str,
+        scope: str = "",
+        *,
+        cloud_id: str | None = None,
+        base_url: str | None = None,
+        token_profile: str = DEFAULT_TOKEN_PROFILE,
+    ) -> dict[str, Any]:
         """Load tokens securely from keyring.
 
         Args:
-            client_id: The OAuth client ID
+            client_id: The OAuth client ID.
+            scope: Requested OAuth scopes.
+            cloud_id: Atlassian Cloud resource ID.
+            base_url: Data Center issuer/resource URL.
+            token_profile: Local principal/token-slot selector.
 
         Returns:
             Dict with the token data or empty dict if no tokens found
         """
-        username = f"oauth-{client_id}"
+        try:
+            identity = cls._storage_identity(
+                client_id,
+                scope,
+                cloud_id=cloud_id,
+                base_url=base_url,
+                token_profile=token_profile,
+            )
+        except ValueError as exc:
+            logger.warning("OAuth tokens were not loaded: %s", exc)
+            cls._warn_if_legacy_tokens_exist(client_id, cloud_id, base_url)
+            return {}
 
-        # Try to load tokens from keyring first
+        username = cls._storage_username(identity)
+
         try:
             token_json = keyring.get_password(KEYRING_SERVICE_NAME, username)
             if token_json:
-                logger.debug(f"Loaded OAuth tokens from keyring for {username}")
-                return json.loads(token_json)
+                token_data = json.loads(token_json)
+                if cls._stored_identity_matches(token_data, identity):
+                    logger.debug(f"Loaded OAuth tokens from keyring for {username}")
+                    return cast(dict[str, Any], token_data)
+                logger.warning(
+                    "Ignored persisted OAuth tokens with mismatched identity metadata"
+                )
         except Exception as e:
             logger.warning(
                 f"Failed to load tokens from keyring: {e}. Trying file fallback."
             )
 
-        # Fall back to loading from file if keyring fails or returns None
-        return OAuthConfig._load_tokens_from_file(client_id)
+        token_data = cls._load_tokens_from_file(identity)
+        if token_data:
+            return token_data
+        cls._warn_if_legacy_tokens_exist(client_id, cloud_id, base_url)
+        return {}
 
     @staticmethod
-    def _load_tokens_from_file(client_id: str) -> dict[str, Any]:
+    def _stored_identity_matches(
+        token_data: Any, expected_identity: dict[str, Any]
+    ) -> bool:
+        """Return whether persisted token metadata exactly matches the request."""
+        if not isinstance(token_data, dict):
+            return False
+        stored_identity = token_data.get("storage_identity")
+        return (
+            isinstance(stored_identity, dict)
+            and stored_identity == expected_identity
+            and type(stored_identity.get("version")) is int
+            and isinstance(stored_identity.get("issuer"), str)
+            and isinstance(stored_identity.get("client_id"), str)
+            and isinstance(stored_identity.get("resource"), str)
+            and isinstance(stored_identity.get("profile"), str)
+            and isinstance(stored_identity.get("scopes"), list)
+            and all(isinstance(scope, str) for scope in stored_identity["scopes"])
+        )
+
+    @classmethod
+    def _load_tokens_from_file(cls, identity: dict[str, Any]) -> dict[str, Any]:
         """Load tokens from a file as fallback.
 
         Args:
-            client_id: The OAuth client ID
+            identity: Complete expected OAuth storage identity.
 
         Returns:
             Dict with the token data or empty dict if no tokens found
         """
-        token_path = Path.home() / ".mcp-atlassian" / f"oauth-{client_id}.json"
+        token_path = (
+            Path.home() / ".mcp-atlassian" / f"{cls._storage_username(identity)}.json"
+        )
 
         if not token_path.exists():
             return {}
@@ -470,13 +611,51 @@ class OAuthConfig:
         try:
             with open(token_path) as f:
                 token_data = json.load(f)
+                if not cls._stored_identity_matches(token_data, identity):
+                    logger.warning(
+                        "Ignored OAuth token file with mismatched identity metadata"
+                    )
+                    return {}
                 logger.debug(
                     f"Loaded OAuth tokens from file {token_path} (fallback storage)"
                 )
-                return token_data
+                return cast(dict[str, Any], token_data)
         except Exception as e:
             logger.error(f"Failed to load tokens from file: {e}")
             return {}
+
+    @classmethod
+    def _warn_if_legacy_tokens_exist(
+        cls, client_id: str, cloud_id: str | None, base_url: str | None
+    ) -> None:
+        """Warn about old ambiguous records without loading or modifying them."""
+        legacy_usernames = {f"oauth-{client_id}"}
+        if cloud_id:
+            legacy_usernames.add(f"oauth-{client_id}-cloud-{cloud_id}")
+        if base_url:
+            url_hash = hashlib.sha256(base_url.encode()).hexdigest()[:8]
+            legacy_usernames.add(f"oauth-{client_id}-dc-{url_hash}")
+
+        legacy_found = False
+        for username in legacy_usernames:
+            try:
+                if keyring.get_password(KEYRING_SERVICE_NAME, username):
+                    legacy_found = True
+                    break
+            except Exception:  # noqa: BLE001 - keyring backends vary
+                break
+
+        legacy_filename = f"oauth-{client_id}.json"
+        legacy_file_found = False
+        if Path(legacy_filename).name == legacy_filename:
+            legacy_path = Path.home() / ".mcp-atlassian" / legacy_filename
+            legacy_file_found = legacy_path.exists()
+        if legacy_found or legacy_file_found:
+            logger.warning(
+                "Legacy OAuth tokens were detected but cannot be safely matched to "
+                "the current scope and token profile. Re-run "
+                "`mcp-atlassian --oauth-setup` to authorize scoped storage."
+            )
 
     @classmethod
     def from_env(
@@ -515,6 +694,11 @@ class OAuthConfig:
         scope = (os.getenv(f"{prefix}_OAUTH_SCOPE") if prefix else None) or os.getenv(
             "ATLASSIAN_OAUTH_SCOPE"
         )
+        token_profile = (
+            (os.getenv(f"{prefix}_OAUTH_TOKEN_PROFILE") if prefix else None)
+            or os.getenv("ATLASSIAN_OAUTH_TOKEN_PROFILE", DEFAULT_TOKEN_PROFILE)
+            or DEFAULT_TOKEN_PROFILE
+        )
 
         # Determine if this is a DC instance
         is_dc = bool(service_url) and not is_atlassian_cloud_url(service_url)
@@ -542,18 +726,21 @@ class OAuthConfig:
                 scope=scope or "",
                 cloud_id=cloud_id,
                 base_url=base_url,
+                token_profile=token_profile,
             )
 
             # Try to load existing tokens
-            token_data = cls.load_tokens(client_id or "")
+            token_data = cls.load_tokens(
+                client_id or "",
+                scope or "",
+                cloud_id=cloud_id,
+                base_url=base_url,
+                token_profile=token_profile,
+            )
             if token_data:
                 config.refresh_token = token_data.get("refresh_token")
                 config.access_token = token_data.get("access_token")
                 config.expires_at = token_data.get("expires_at")
-                if not config.cloud_id and "cloud_id" in token_data:
-                    config.cloud_id = token_data["cloud_id"]
-                if not config.base_url and "base_url" in token_data:
-                    config.base_url = token_data["base_url"]
 
             return config
 

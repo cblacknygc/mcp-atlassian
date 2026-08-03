@@ -19,7 +19,7 @@ import webbrowser
 from dataclasses import dataclass
 from html import escape as html_escape
 
-from ..utils.oauth import OAuthConfig
+from ..utils.oauth import DEFAULT_TOKEN_PROFILE, OAuthConfig
 
 # Configure logging
 logger = logging.getLogger("mcp-atlassian.oauth-setup")
@@ -210,6 +210,7 @@ class OAuthSetupArgs:
     client_secret: str
     redirect_uri: str
     scope: str
+    token_profile: str = DEFAULT_TOKEN_PROFILE
 
 
 def run_oauth_flow(args: OAuthSetupArgs) -> bool:
@@ -227,6 +228,7 @@ def run_oauth_flow(args: OAuthSetupArgs) -> bool:
         client_secret=args.client_secret,
         redirect_uri=args.redirect_uri,
         scope=args.scope,
+        token_profile=args.token_profile,
     )
 
     # Generate a random state for CSRF protection
@@ -298,6 +300,7 @@ def run_oauth_flow(args: OAuthSetupArgs) -> bool:
             logger.info(f"ATLASSIAN_OAUTH_REDIRECT_URI={oauth_config.redirect_uri}")
             logger.info(f"ATLASSIAN_OAUTH_SCOPE={oauth_config.scope}")
             logger.info(f"ATLASSIAN_OAUTH_CLOUD_ID={oauth_config.cloud_id}")
+            logger.info(f"ATLASSIAN_OAUTH_TOKEN_PROFILE={oauth_config.token_profile}")
             logger.info("------------------------------------------------------------")
             logger.info("")
             logger.info(
@@ -307,7 +310,8 @@ def run_oauth_flow(args: OAuthSetupArgs) -> bool:
                 "They are stored securely in your system keyring and will be loaded automatically."
             )
             logger.info(
-                f"Token storage location (backup): ~/.mcp-atlassian/oauth-{oauth_config.client_id}.json"
+                "Token storage uses a versioned, profile-scoped file under "
+                "~/.mcp-atlassian."
             )
 
             # Generate VS Code configuration JSON snippet
@@ -337,6 +341,8 @@ def run_oauth_flow(args: OAuthSetupArgs) -> bool:
                             "ATLASSIAN_OAUTH_SCOPE",
                             "-e",
                             "ATLASSIAN_OAUTH_CLOUD_ID",
+                            "-e",
+                            "ATLASSIAN_OAUTH_TOKEN_PROFILE",
                             "ghcr.io/sooperset/mcp-atlassian:latest",
                         ],
                         "env": {
@@ -347,6 +353,9 @@ def run_oauth_flow(args: OAuthSetupArgs) -> bool:
                             "ATLASSIAN_OAUTH_REDIRECT_URI": oauth_config.redirect_uri,
                             "ATLASSIAN_OAUTH_SCOPE": oauth_config.scope,
                             "ATLASSIAN_OAUTH_CLOUD_ID": oauth_config.cloud_id,
+                            "ATLASSIAN_OAUTH_TOKEN_PROFILE": (
+                                oauth_config.token_profile
+                            ),
                         },
                     }
                 }
@@ -431,6 +440,13 @@ def run_oauth_setup() -> int:
         _prompt_for_input("OAuth Scopes (space-separated)", "ATLASSIAN_OAUTH_SCOPE")
         or default_scope
     )
+    token_profile = (
+        _prompt_for_input(
+            "OAuth Token Profile (local account slot)",
+            "ATLASSIAN_OAUTH_TOKEN_PROFILE",
+        )
+        or DEFAULT_TOKEN_PROFILE
+    )
 
     # Validate required arguments
     if not client_id:
@@ -446,6 +462,7 @@ def run_oauth_setup() -> int:
         client_secret=client_secret,
         redirect_uri=redirect_uri,
         scope=scope,
+        token_profile=token_profile,
     )
 
     success = run_oauth_flow(args)
