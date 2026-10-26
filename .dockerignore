@@ -48,6 +48,7 @@ docs/
 !README.md
 
 # Temporal and backup files
+backup/
 *.tmp
 *.bak
 *.backup
