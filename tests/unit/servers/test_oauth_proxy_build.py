@@ -172,6 +172,27 @@ def test_build_auth_provider_prefers_public_base_url(monkeypatch):
     assert provider._redirect_path == "/callback"
 
 
+def test_build_auth_provider_uses_exact_resource_url(monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://mcp.example.com/mcp-atlassian")
+    monkeypatch.setenv(
+        "ATLASSIAN_OAUTH_RESOURCE_URL",
+        "https://tunnel.example.com/v1/mcp/tunnel_test",
+    )
+    monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
+    _set_required_oauth_env(
+        monkeypatch, redirect_uri="https://mcp.example.com/mcp-atlassian/callback"
+    )
+
+    provider = _build_auth_provider()
+
+    assert provider is not None
+    assert str(provider.base_url) == "https://mcp.example.com/mcp-atlassian"
+    provider.set_mcp_path("/mcp")
+    assert str(provider._resource_url) == (
+        "https://tunnel.example.com/v1/mcp/tunnel_test"
+    )
+
+
 def test_build_auth_provider_supports_root_redirect_uri(monkeypatch):
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
     monkeypatch.delenv("ATLASSIAN_OAUTH_INSTANCE_URL", raising=False)

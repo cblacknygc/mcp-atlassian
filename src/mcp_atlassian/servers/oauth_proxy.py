@@ -79,17 +79,27 @@ class HardenedOAuthProxy(OAuthProxy):
         self,
         *,
         base_url: AnyHttpUrl | str,
+        resource_url: AnyHttpUrl | str | None = None,
         redirect_path: str | None = None,
         allowed_grant_types: list[str] | None = None,
         forced_scopes: list[str] | None = None,
         **kwargs: object,
     ) -> None:
+        self._resource_url_override = (
+            AnyHttpUrl(resource_url) if isinstance(resource_url, str) else resource_url
+        )
         super().__init__(base_url=base_url, redirect_path=redirect_path, **kwargs)
         self._allowed_grant_types = _normalize_list(allowed_grant_types)
         self._forced_scopes = _normalize_list(forced_scopes)
         self._proxy_callback_target = _redirect_target(
             _callback_uri(str(self.base_url), self._redirect_path)
         )
+
+    def _get_resource_url(self, path: str | None = None) -> AnyHttpUrl | None:
+        """Return an exact externally visible resource URL when configured."""
+        if self._resource_url_override is not None:
+            return self._resource_url_override
+        return super()._get_resource_url(path)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         for redirect_uri in client_info.redirect_uris or []:
