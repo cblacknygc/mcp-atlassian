@@ -212,6 +212,7 @@ JIRA_PROJECT_KEY_PATTERN=^[A-Z0-9][A-Z0-9_]*$
 | `CONFLUENCE_ATTACHMENT_DOWNLOAD_USE_V1` | Download Confluence attachments via the v1 REST endpoint instead of the legacy `/download/` link (removed on Cloud). Unset = auto (v1 on Cloud, legacy on Server/DC); `true`/`false` to force. |
 | `ATLASSIAN_OAUTH_PROXY_ENABLE` | Enable OAuth proxy + DCR + `/.well-known/*` routes (`true`/`false`) |
 | `PUBLIC_BASE_URL` | Public base URL for OAuth discovery metadata |
+| `ATLASSIAN_OAUTH_RESOURCE_URL` | Exact protected-resource URL clients use (for example, the OpenAI tunnel MCP URL); overrides the resource URL in protected-resource metadata while leaving OAuth routes at `PUBLIC_BASE_URL` |
 | `ATLASSIAN_OAUTH_ALLOWED_CLIENT_REDIRECT_URIS` | Comma-separated allowed redirect URI patterns for DCR clients |
 | `ATLASSIAN_OAUTH_ALLOWED_GRANT_TYPES` | Comma-separated grant types allowed during DCR |
 | `ATLASSIAN_OAUTH_REQUIRE_CONSENT` | Require local consent page before upstream redirect (`true`/`false`) |

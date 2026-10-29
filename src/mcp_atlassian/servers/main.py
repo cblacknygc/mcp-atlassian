@@ -900,6 +900,7 @@ def _build_auth_provider() -> HardenedOAuthProxy | None:
         upstream_client_secret=client_secret,
         token_verifier=verifier,
         base_url=base_url,
+        resource_url=os.getenv("ATLASSIAN_OAUTH_RESOURCE_URL"),
         redirect_path=redirect_path,
         allowed_client_redirect_uris=allowed_client_redirect_uris,
         valid_scopes=scopes or None,
