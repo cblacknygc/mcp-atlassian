@@ -6,8 +6,7 @@ policy security gate.
 
 ## Targets
 
-- `published`: the exact FastMCP prerelease and paired MCP SDK prerelease locked
-  by the root project.
+- `published`: FastMCP 4.2.0 and MCP SDK 2.3.0, as locked by the root project.
 - `upstream-main`: the same project environment with both `fastmcp` and
   `fastmcp-slim` overlaid from one exact PrefectHQ checkout.
 
@@ -51,4 +50,4 @@ Until G4 passes, the staging PATs must also be read-only at the Atlassian
 permission layer.
 
 The wire probe and its safety preflight are intentionally compatible with both
-the FastMCP 3.4.4/MCP SDK 1 baseline and the FastMCP 4/MCP SDK 2 target.
+FastMCP 3/MCP SDK 1 and FastMCP 4/MCP SDK 2.
