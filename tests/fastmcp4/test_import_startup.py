@@ -24,6 +24,9 @@ assert oauth_proxy.HardenedOAuthProxy
 """
     env = os.environ.copy()
     env["FASTMCP_HOME"] = str(tmp_path / "fastmcp-home")
+    files_dir = tmp_path / "files"
+    files_dir.mkdir()
+    env["MCP_ATLASSIAN_FILES_DIR"] = str(files_dir)
     completed = subprocess.run(
         [sys.executable, "-c", probe],
         check=False,
