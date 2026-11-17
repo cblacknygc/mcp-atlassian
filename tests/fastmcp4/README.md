@@ -15,10 +15,15 @@ policy security gate.
 - `smoke`: dependency provenance and production import/startup.
 - `compat-only`: public FastMCP client, mounted tool, and schema behavior. A
   green result does **not** exercise mcp-atlassian policy parity.
-- `policy`: the public-protocol policy-bypass canary.
+- `policy`: the public-protocol policy-bypass canary, the current unit policy
+  contracts, and the HTTP policy checks.
+- `auth`: hermetic OAuth proxy construction and DCR/PKCE integration tests.
 - `protocol`: public MCP schema serialization behavior.
-- `broad-compat`: the existing server unit suite, classified against the same
-  blocker ledger.
+- `integration`: stateful and stateless HTTP against the production app, with
+  the MCP SDK and a mocked Jira fetcher, including successive requests with
+  different placeholder service headers.
+- `broad-compat`: the existing server unit suite excluding the policy and auth
+  contracts, classified against the same blocker ledger.
 
 Run the advisory report:
 
@@ -35,6 +40,24 @@ uv run pytest tests/fastmcp4/test_tool_policy_contract.py
 
 `blockers.toml` is the machine-readable ledger. A known blocker that starts
 passing is reported as a resolution candidate instead of silently disappearing.
+Advisory mode returns zero even if the report is not green. Inspect
+`summary.json` or `summary.md`; a passing suite does not establish that all
+release-readiness gates have passed. Skipped contracts are reported as
+incomplete and an empty selection as not run. Every suite includes dependency
+provenance so results cannot silently use the wrong target. By default each
+target and suite writes to its own `.readiness/<target>/<suite>/` directory.
+
+The feature-branch workflow runs the published target on Python 3.11 and 3.13
+on pushes to `feat/fastmcp-4`. It produces separate all, policy, and auth
+reports and uploads JUnit, provenance, and summary artifacts. It has no live
+staging profile or schedule. Existing runs can be rerun in GitHub Actions; manual
+dispatch requires a workflow on the default branch and is not configured here.
+
+For `upstream-main`, install `fastmcp` and `fastmcp-slim` as editables from the
+same clean checkout, install MCP SDK 2, and set `FASTMCP_GIT_SHA` to that
+checkout's exact commit. The smoke test checks the installed source paths,
+checkout cleanliness, and commit identity; this overlay is advisory and is
+not the production lock.
 
 ## Live staging
 

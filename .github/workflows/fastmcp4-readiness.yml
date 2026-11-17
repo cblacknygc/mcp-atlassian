@@ -1,0 +1,52 @@
+name: FastMCP 4 readiness
+
+on:
+  push:
+    branches: [feat/fastmcp-4]
+
+permissions:
+  contents: read
+
+jobs:
+  published:
+    name: Published readiness (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    env:
+      FASTMCP_CHECK_FOR_UPDATES: "off"
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.10.4"
+          cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-extras --dev
+      - name: Run advisory readiness suite
+        run: |
+          for suite in all policy auth; do
+            uv run --frozen python scripts/fastmcp4_readiness.py run \
+              --target published --suite "$suite" --advisory \
+              --output-dir "$RUNNER_TEMP/fastmcp4-readiness/$suite"
+            cat "$RUNNER_TEMP/fastmcp4-readiness/$suite/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload readiness evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fastmcp4-readiness-${{ matrix.python-version }}
+          path: |
+            ${{ runner.temp }}/fastmcp4-readiness/*/provenance.json
+            ${{ runner.temp }}/fastmcp4-readiness/*/junit.xml
+            ${{ runner.temp }}/fastmcp4-readiness/*/summary.json
+            ${{ runner.temp }}/fastmcp4-readiness/*/summary.md
+          if-no-files-found: warn
