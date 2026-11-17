@@ -298,6 +298,8 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
             if isinstance(lifespan_ctx_dict, dict)
             else None
         )
+        if app_lifespan_state is None:
+            return None
         read_only = (
             getattr(app_lifespan_state, "read_only", False)
             if app_lifespan_state
@@ -415,10 +417,12 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
 
     async def list_tools(self, *, run_middleware: bool = True) -> list[FastMCPTool]:
         """List tools after applying mcp-atlassian's authorization policy."""
-        all_tools = list(await super().list_tools(run_middleware=run_middleware))
+        if run_middleware:
+            return list(await super().list_tools(run_middleware=True))
+        all_tools = list(await super().list_tools(run_middleware=False))
         ctx = self._tool_filter_context()
         if ctx is None:
-            return all_tools
+            return []
         return [
             tool_obj
             for tool_obj in all_tools
@@ -468,15 +472,20 @@ class AtlassianMCP(ErrorPreservingFastMCP[MainAppContext]):
         # disabled, or deployment-incompatible) cannot be invoked directly by name.
         # Under an active filter context, denials and genuinely unknown tools raise
         # byte-identical messages here (no exists-but-disabled leak).
+        if run_middleware:
+            return await super().call_tool(
+                name, arguments, version=version, run_middleware=True
+            )
         ctx = self._tool_filter_context()
-        if ctx is not None:
-            tool_obj = await self.get_tool(name, version=version)
-            if (
-                tool_obj is None
-                or not self._is_tool_authorized(name, tool_obj, ctx)
-                or not self._is_tool_supported_on_deployment(tool_obj, ctx)
-            ):
-                raise NotFoundError(f"Unknown tool: {name}")
+        if ctx is None:
+            raise NotFoundError(f"Unknown tool: {name}")
+        tool_obj = await self.get_tool(name, version=version)
+        if (
+            tool_obj is None
+            or not self._is_tool_authorized(name, tool_obj, ctx)
+            or not self._is_tool_supported_on_deployment(tool_obj, ctx)
+        ):
+            raise NotFoundError(f"Unknown tool: {name}")
         return await super().call_tool(
             name,
             arguments,

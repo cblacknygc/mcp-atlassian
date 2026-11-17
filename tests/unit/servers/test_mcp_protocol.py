@@ -162,18 +162,24 @@ class TestMCPProtocolIntegration:
 
             # Write tool is read-only-excluded -> denied before reaching the executor.
             with pytest.raises(NotFoundError) as denied_exc:
-                await atlassian_mcp_server.call_tool("jira_create_issue", {})
+                await atlassian_mcp_server.call_tool(
+                    "jira_create_issue", {}, run_middleware=False
+                )
             mock_super.assert_not_called()
 
             # Cloud-only tool is deployment-excluded on Server/DC -> denied.
             with pytest.raises(NotFoundError) as deployment_exc:
-                await atlassian_mcp_server.call_tool("jira_batch_get_changelogs", {})
+                await atlassian_mcp_server.call_tool(
+                    "jira_batch_get_changelogs", {}, run_middleware=False
+                )
             mock_super.assert_not_called()
 
             # Genuinely unknown tool -> denied by our override too (never reaches
             # super, whose repr-quoted message would leak tool existence).
             with pytest.raises(NotFoundError) as unknown_exc:
-                await atlassian_mcp_server.call_tool("jira_no_such_tool", {})
+                await atlassian_mcp_server.call_tool(
+                    "jira_no_such_tool", {}, run_middleware=False
+                )
             mock_super.assert_not_called()
 
             # Message parity: hidden-but-existing and genuinely unknown tools
@@ -185,7 +191,9 @@ class TestMCPProtocolIntegration:
             assert str(unknown_exc.value) == "Unknown tool: jira_no_such_tool"
 
             # Read tool is enabled -> passes the gate and reaches the executor.
-            result = await atlassian_mcp_server.call_tool("jira_get_issue", {})
+            result = await atlassian_mcp_server.call_tool(
+                "jira_get_issue", {}, run_middleware=False
+            )
             assert result == "EXECUTED"
             mock_super.assert_called_once()
 
@@ -201,7 +209,9 @@ class TestMCPProtocolIntegration:
 
         with patch.object(main_mcp, "_mcp_server") as mcp_server:
             mcp_server.request_context = request_context
-            listed_tool_names = {tool.name for tool in await main_mcp._list_tools_mcp()}
+            listed_tool_names = {
+                tool.name for tool in await main_mcp.list_tools(run_middleware=False)
+            }
 
         expected_cloud_only_tools = {
             f"jira_{name}" for name in JIRA_CLOUD_ONLY_TOOL_NAMES

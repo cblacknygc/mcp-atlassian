@@ -169,3 +169,41 @@ async def test_enabled_read_tool_uses_public_call_path(
     assert not _is_error(allowed_call)
     get_jira_fetcher.assert_awaited_once()
     jira_fetcher.get_issue.assert_called_once()
+
+
+@pytest.mark.anyio
+@pytest.mark.security_regression
+async def test_missing_policy_context_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Missing policy context hides tools and prevents direct execution."""
+    _configure_jira(
+        monkeypatch,
+        tmp_path,
+        {
+            "READ_ONLY_MODE": "false",
+            "ENABLED_TOOLS": "jira_get_issue",
+            "TOOLSETS": "all",
+        },
+    )
+    main_module = importlib.import_module("mcp_atlassian.servers.main")
+    with (
+        patch.object(main_module.main_mcp, "_tool_filter_context", return_value=None),
+        patch(
+            "mcp_atlassian.servers.jira.get_jira_fetcher",
+            new_callable=AsyncMock,
+        ) as get_jira_fetcher,
+    ):
+        async with Client(main_module.main_mcp) as client:
+            tools = await client.list_tools()
+            hidden_call = await client.call_tool_mcp(
+                "jira_create_issue", _VALID_WRITE_ARGUMENTS
+            )
+            unknown_call = await client.call_tool_mcp("jira_no_such_tool", {})
+
+    assert not tools
+    get_jira_fetcher.assert_not_awaited()
+    assert _is_error(hidden_call) and _is_error(unknown_call)
+    assert _error_text(hidden_call).replace("jira_create_issue", "<tool>") == (
+        _error_text(unknown_call).replace("jira_no_such_tool", "<tool>")
+    )

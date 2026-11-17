@@ -87,7 +87,7 @@ async def test_run_server_invalid_transport():
 @pytest.mark.anyio
 async def test_tool_registration_issue_dates_name():
     """Ensure issue dates tool is registered with a single Jira prefix."""
-    tools = await main_mcp.list_tools()
+    tools = await super(AtlassianMCP, main_mcp).list_tools(run_middleware=False)
     tool_names = {tool.name for tool in tools}
     assert "jira_get_issue_dates" in tool_names
     assert "jira_jira_get_issue_dates" not in tool_names
@@ -114,7 +114,10 @@ async def test_tool_registration_issue_dates_name():
 )
 async def test_additive_write_tools_are_non_destructive(tool_name: str) -> None:
     """Ensure additive write tools advertise that they preserve existing state."""
-    tools = {tool.name: tool for tool in await main_mcp.list_tools()}
+    tools = {
+        tool.name: tool
+        for tool in await super(AtlassianMCP, main_mcp).list_tools(run_middleware=False)
+    }
 
     assert tools[tool_name].annotations.destructiveHint is False
 
@@ -130,7 +133,10 @@ async def test_additive_write_tools_are_non_destructive(tool_name: str) -> None:
 )
 async def test_state_changing_write_tools_are_destructive(tool_name: str) -> None:
     """Ensure tools that remove or reassign state advertise destructive behavior."""
-    tools = {tool.name: tool for tool in await main_mcp.list_tools()}
+    tools = {
+        tool.name: tool
+        for tool in await super(AtlassianMCP, main_mcp).list_tools(run_middleware=False)
+    }
 
     assert tools[tool_name].annotations.destructiveHint is True
 

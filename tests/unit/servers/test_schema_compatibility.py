@@ -14,7 +14,11 @@ import json
 import pytest
 from mcp_types import Tool as MCPTool
 
-from mcp_atlassian.servers.main import _sanitize_schema_for_compatibility, main_mcp
+from mcp_atlassian.servers.main import (
+    AtlassianMCP,
+    _sanitize_schema_for_compatibility,
+    main_mcp,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -34,7 +38,7 @@ def all_tool_schemas() -> dict[str, dict]:
     import asyncio
 
     async def _load() -> dict[str, dict]:
-        tools = await main_mcp.list_tools()
+        tools = await super(AtlassianMCP, main_mcp).list_tools(run_middleware=False)
         schemas: dict[str, dict] = {}
         for tool_obj in tools:
             name = tool_obj.name
@@ -64,7 +68,7 @@ def _get_tool_names() -> list[str]:
     import asyncio
 
     async def _load() -> list[str]:
-        tools = await main_mcp.list_tools()
+        tools = await super(AtlassianMCP, main_mcp).list_tools(run_middleware=False)
         return sorted(tool.name for tool in tools)
 
     # Use asyncio.run() which creates a fresh event loop
