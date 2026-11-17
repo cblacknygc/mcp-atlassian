@@ -8,6 +8,8 @@ import pytest
 from mcp.server.auth.provider import AuthorizationParams, AuthorizeError
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
+from starlette.applications import Starlette
+from starlette.testclient import TestClient
 
 from mcp_atlassian.servers.main import _build_auth_provider
 from mcp_atlassian.utils.oauth import CLOUD_AUTHORIZE_URL, CLOUD_TOKEN_URL
@@ -162,6 +164,7 @@ def test_build_auth_provider_infers_base_url_from_redirect_uri(monkeypatch):
 
 
 def test_build_auth_provider_prefers_public_base_url(monkeypatch):
+    monkeypatch.delenv("ATLASSIAN_OAUTH_RESOURCE_URL", raising=False)
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://mcp.example.com/mcp-atlassian")
     monkeypatch.delenv("ATLASSIAN_OAUTH_INSTANCE_URL", raising=False)
     monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
@@ -174,6 +177,44 @@ def test_build_auth_provider_prefers_public_base_url(monkeypatch):
     assert provider is not None
     assert str(provider.base_url) == "https://mcp.example.com/mcp-atlassian"
     assert provider._redirect_path == "/callback"
+    provider.set_mcp_path("/mcp")
+    assert str(provider._resource_url) == "https://mcp.example.com/mcp-atlassian/mcp"
+
+
+def test_build_auth_provider_uses_exact_resource_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://mcp.example.com/mcp-atlassian")
+    monkeypatch.setenv(
+        "ATLASSIAN_OAUTH_RESOURCE_URL",
+        "https://tunnel.example.com/v1/mcp/tunnel_test",
+    )
+    monkeypatch.setenv("JIRA_URL", "https://jira.example.com")
+    _set_required_oauth_env(
+        monkeypatch, redirect_uri="https://mcp.example.com/mcp-atlassian/callback"
+    )
+
+    provider = _build_auth_provider()
+
+    assert provider is not None
+    assert str(provider.base_url) == "https://mcp.example.com/mcp-atlassian"
+    provider.set_mcp_path("/mcp")
+    assert str(provider._resource_url) == (
+        "https://tunnel.example.com/v1/mcp/tunnel_test"
+    )
+    routes = provider.get_routes("/mcp")
+    resource_route = next(
+        route for route in routes if "oauth-protected-resource" in route.path
+    )
+    with TestClient(Starlette(routes=routes)) as client:
+        response = client.get(resource_route.path)
+    assert response.status_code == 200
+    assert response.json()["resource"] == (
+        "https://tunnel.example.com/v1/mcp/tunnel_test"
+    )
+    assert response.json()["authorization_servers"] == [
+        "https://mcp.example.com/mcp-atlassian"
+    ]
 
 
 def test_build_auth_provider_supports_root_redirect_uri(monkeypatch):
@@ -374,6 +415,48 @@ async def test_authorize_does_not_forward_resource_to_atlassian(monkeypatch):
 
 @pytest.mark.anyio
 async def test_authorize_still_rejects_resource_for_another_server(monkeypatch):
+    provider = _build_cloud_provider_without_consent(monkeypatch)
+
+    with pytest.raises(AuthorizeError) as exc_info:
+        await provider.authorize(
+            _client(), _authorization_params(resource="https://other.example.com/mcp")
+        )
+
+    assert exc_info.value.error == "invalid_target"
+
+
+@pytest.mark.anyio
+async def test_tunnel_resource_authorizes_with_public_dc_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tunnel_url = "https://tunnel.example.com/v1/mcp/tunnel_test"
+    monkeypatch.setenv("ATLASSIAN_OAUTH_RESOURCE_URL", tunnel_url)
+    _build_cloud_provider_without_consent(monkeypatch)
+    monkeypatch.delenv("JIRA_URL")
+    monkeypatch.setenv("CONFLUENCE_URL", "https://wiki.example.com")
+    provider = _build_auth_provider()
+    assert provider is not None
+    provider.set_mcp_path("/mcp")
+
+    upstream_url = await provider.authorize(
+        _client(), _authorization_params(resource=tunnel_url)
+    )
+
+    query = parse_qs(urlparse(upstream_url).query)
+    assert upstream_url.startswith(
+        "https://wiki.example.com/rest/oauth2/latest/authorize?"
+    )
+    assert query["redirect_uri"] == ["https://mcp.example.com/callback"]
+    assert "resource" not in query
+
+
+@pytest.mark.anyio
+async def test_tunnel_override_still_rejects_unrelated_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "ATLASSIAN_OAUTH_RESOURCE_URL", "https://tunnel.example.com/v1/mcp/tunnel_test"
+    )
     provider = _build_cloud_provider_without_consent(monkeypatch)
 
     with pytest.raises(AuthorizeError) as exc_info:
