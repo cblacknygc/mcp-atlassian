@@ -85,6 +85,7 @@ markers = [
     "fastmcp4_compat: compatibility-only FastMCP 4 behavior; does not exercise policy parity",
     "fastmcp4_policy: FastMCP 4 tool-policy security contract",
     "fastmcp4_protocol: FastMCP 4 public MCP protocol contract",
+    "fastmcp4_integration: hermetic FastMCP 4 server transport integration",
 ]
 
 [tool.ruff]

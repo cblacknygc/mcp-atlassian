@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastmcp import Client
 
+pytestmark = pytest.mark.fastmcp4_policy
+
 _VALID_WRITE_ARGUMENTS = {
     "project_key": "TEST",
     "summary": "Policy contract must not create this issue",
