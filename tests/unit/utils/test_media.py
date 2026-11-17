@@ -6,6 +6,7 @@ import pytest
 
 from mcp_atlassian.utils.media import (
     ATTACHMENT_MAX_BYTES,
+    AttachmentTooLargeError,
     fetch_and_encode_attachment,
     is_image_attachment,
 )
@@ -41,6 +42,22 @@ def test_attachment_max_bytes_value() -> None:
             "doc.pdf",
             (False, "application/octet-stream"),
         ),
+        # JSM customer-portal uploads report multipart/form-data
+        (
+            "multipart/form-data",
+            "WhatsApp Image 2026-08-15 at 23.28.03.jpeg",
+            (True, "image/jpeg"),
+        ),
+        (
+            "multipart/form-data",
+            "screenshot.png",
+            (True, "image/png"),
+        ),
+        (
+            "multipart/form-data",
+            "report.pdf",
+            (False, "multipart/form-data"),
+        ),
         # None MIME + image extension -> detected as image
         (None, "photo.png", (True, "image/png")),
         # None MIME + non-image extension -> not an image
@@ -56,6 +73,9 @@ def test_attachment_max_bytes_value() -> None:
         "octet-stream-jpg-ext",
         "binary-png-ext",
         "octet-stream-pdf-ext",
+        "jsm-portal-jpeg-ext",
+        "jsm-portal-png-ext",
+        "jsm-portal-pdf-ext",
         "none-mime-image-ext",
         "none-mime-pdf-ext",
         "both-none",
@@ -106,6 +126,23 @@ class TestFetchAndEncodeAttachment:
         assert encoded is not None
         assert mime == "image/webp"
         assert size == len(raw)
+
+    def test_fetch_stopped_at_limit_reports_bytes_read(self) -> None:
+        """A fetch that stopped at the limit is reported as oversized, not failed."""
+
+        def stopped(_url: str) -> bytes:
+            raise AttachmentTooLargeError(
+                ATTACHMENT_MAX_BYTES + 1, ATTACHMENT_MAX_BYTES
+            )
+
+        encoded, mime, size = fetch_and_encode_attachment(
+            fetch_fn=stopped,
+            url="https://example.com/big.png",
+            filename="big.png",
+        )
+        assert encoded is None
+        assert mime is None
+        assert size == ATTACHMENT_MAX_BYTES + 1
 
     def test_fetched_size_exceeds_limit(self) -> None:
         """Return (None, None, actual_size) when oversized."""

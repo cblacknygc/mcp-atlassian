@@ -77,13 +77,16 @@ class TestLinksMixin:
 
     # --- JIRA_INTERNAL_ONLY_PROJECTS guard on link comments ---
 
-    def test_create_issue_link_comment_internal_only_inward_rejected(self, links_mixin):
+    @pytest.mark.parametrize("issue_key", ["CC-123", "CC%2D123", "%43C-123"])
+    def test_create_issue_link_comment_internal_only_inward_rejected(
+        self, links_mixin, issue_key
+    ):
         """A link comment is rejected when the INWARD issue is in a listed
         project, before any API call."""
         links_mixin.config.internal_only_projects = frozenset({"CC"})
         data = {
             "type": {"name": "Blocks"},
-            "inwardIssue": {"key": "CC-123"},
+            "inwardIssue": {"key": issue_key},
             "outwardIssue": {"key": "PROJ-456"},
             "comment": {"body": "Client update"},
         }
@@ -129,6 +132,10 @@ class TestLinksMixin:
         """A link comment between two unlisted projects passes through even
         with the guard configured for another project."""
         links_mixin.config.internal_only_projects = frozenset({"CC"})
+        links_mixin.jira.issue.side_effect = lambda key, fields=None: {
+            "key": key,
+            "fields": {"project": {"key": key.split("-")[0]}},
+        }
         data = {
             "type": {"name": "Blocks"},
             "inwardIssue": {"key": "PROJ-123"},
@@ -261,6 +268,16 @@ class TestLinksMixin:
     def test_remove_issue_link_empty_id(self, links_mixin):
         with pytest.raises(ValueError, match="Link ID is required"):
             links_mixin.remove_issue_link("")
+
+    @pytest.mark.security_regression
+    @pytest.mark.parametrize(
+        "link_id", ["../issue/PROJ-1", "10000/../../issue/PROJ-1", "1%2F..", "１２３"]
+    )
+    def test_remove_issue_link_rejects_non_numeric_id(self, links_mixin, link_id):
+        """A crafted link_id must not retarget the DELETE (e.g. to an issue)."""
+        with pytest.raises(ValueError, match="ASCII digits"):
+            links_mixin.remove_issue_link(link_id)
+        links_mixin.jira.remove_issue_link.assert_not_called()
 
     def test_remove_issue_link_authentication_error(self, links_mixin):
         link_id = "10000"

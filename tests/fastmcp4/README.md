@@ -39,7 +39,7 @@ passing is reported as a resolution candidate instead of silently disappearing.
 
 ## Live staging
 
-`scripts/mcp_wire_probe.py --staging-stdio-pat` uses only the MCP SDK as its
+`scripts/mcp_wire_probe.py --staging-dc-pat` uses only the MCP SDK as its
 client, starts the server as a subprocess, and performs bounded read probes
 against pre-existing Jira DC and Confluence DC objects. It enforces
 `READ_ONLY_MODE=true`, one concurrent Atlassian request, retries disabled, and

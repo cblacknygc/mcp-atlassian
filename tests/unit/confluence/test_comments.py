@@ -1,6 +1,8 @@
 """Unit tests for the CommentsMixin class."""
 
-from unittest.mock import MagicMock, call, patch
+import json
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 import requests
@@ -8,6 +10,7 @@ import requests
 from mcp_atlassian.confluence.comments import CommentsMixin
 from mcp_atlassian.confluence.config import ConfluenceConfig
 from mcp_atlassian.models.confluence import ConfluenceComment
+from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
 from tests.fixtures.confluence_mocks import (
     MOCK_COMMENT_REPLY_V1_RESPONSE,
     MOCK_COMMENT_REPLY_V2_RESPONSE,
@@ -92,7 +95,12 @@ class TestCommentsMixin:
 
         # Verify
         comments_mixin.confluence.get_page_comments.assert_called_once_with(
-            content_id=page_id, expand="body.view.value,version", depth="all"
+            content_id=page_id,
+            expand=(
+                "body.view.value,version,container,ancestors,"
+                "extensions.inlineProperties,extensions.resolution"
+            ),
+            depth="all",
         )
         assert len(result) == 1
         assert result[0].body == "Processed Markdown"
@@ -125,6 +133,41 @@ class TestCommentsMixin:
         assert len(result) == 1
         comment = result[0]
         assert comment.body == "<p>Processed HTML</p>"
+
+    def test_get_page_comments_paginates_v1_results(self, comments_mixin):
+        """All v1 comment pages are returned when Confluence provides next."""
+        first_comment = {
+            "id": "first",
+            "body": {"view": {"value": "<p>First</p>"}},
+        }
+        second_comment = {
+            "id": "second",
+            "body": {"view": {"value": "<p>Second</p>"}},
+        }
+        comments_mixin.confluence.get_page_comments.side_effect = [
+            {
+                "results": [first_comment],
+                "start": 0,
+                "limit": 1,
+                "size": 1,
+                "_links": {"next": "/rest/api/content/12345/child/comment?start=1"},
+            },
+            {
+                "results": [second_comment],
+                "start": 1,
+                "limit": 1,
+                "size": 1,
+                "_links": {},
+            },
+        ]
+
+        result = comments_mixin.get_page_comments("12345")
+
+        assert [comment.id for comment in result] == ["first", "second"]
+        assert comments_mixin.confluence.get_page_comments.call_count == 2
+        second_call = comments_mixin.confluence.get_page_comments.call_args_list[1]
+        assert second_call.kwargs["start"] == 1
+        assert second_call.kwargs["limit"] == 1
 
     def test_get_page_comments_api_error(self, comments_mixin):
         """Test handling of API errors."""
@@ -704,6 +747,53 @@ class TestConfluenceCommentModel:
         result = comment.to_simplified_dict()
         assert "location" not in result
 
+    def test_inline_metadata_from_v1_extensions(self):
+        """Inline anchor and resolution metadata survive v1 simplification."""
+        comment = ConfluenceComment.from_api_response(MOCK_INLINE_COMMENT_V1_RESPONSE)
+
+        assert comment.marker_ref == "marker-ref-123"
+        assert comment.original_selection == "some text to anchor"
+        assert comment.resolution_status == "open"
+        assert comment.created == "2024-01-03T10:00:00.000Z"
+        assert comment.to_simplified_dict()["marker_ref"] == "marker-ref-123"
+
+    def test_inline_metadata_from_v2_properties(self):
+        """Current Cloud v2 inline properties are normalized."""
+        data = {
+            "id": "456789123",
+            "body": {"view": {"value": "<p>Inline comment</p>"}},
+            "parentCommentId": "123456789",
+            "properties": {
+                "inlineMarkerRef": "cloud-marker-ref",
+                "inlineOriginalSelection": "selected cloud text",
+            },
+            "resolutionStatus": "resolved",
+        }
+
+        result = ConfluenceComment.from_api_response(data).to_simplified_dict()
+
+        assert result["parent_comment_id"] == "123456789"
+        assert result["marker_ref"] == "cloud-marker-ref"
+        assert result["original_selection"] == "selected cloud text"
+        assert result["resolution_status"] == "resolved"
+
+    def test_parent_comment_from_v1_ancestors(self):
+        """Server/DC replies use the nearest comment ancestor as their parent."""
+        data = {
+            "id": "reply-2",
+            "body": {"view": {"value": "<p>Nested reply</p>"}},
+            "container": {"id": "page-1", "type": "page"},
+            "ancestors": [
+                {"id": "page-1", "type": "page"},
+                {"id": "root-comment", "type": "comment"},
+                {"id": "reply-1", "type": "comment"},
+            ],
+        }
+
+        comment = ConfluenceComment.from_api_response(data)
+
+        assert comment.parent_comment_id == "reply-1"
+
 
 class TestGetInlineComments:
     """Tests for get_inline_comments method."""
@@ -735,10 +825,16 @@ class TestGetInlineComments:
         assert len(result) == 1
         assert result[0].location == "inline"
         assert result[0].id == "333444555"
+        assert result[0].marker_ref == "marker-ref-123"
+        assert result[0].original_selection == "some text to anchor"
+        assert result[0].resolution_status == "open"
         # Verify expanded fields were requested
         comments_mixin_dc.confluence.get_page_comments.assert_called_once_with(
             content_id=page_id,
-            expand="body.view.value,version,extensions.inlineProperties",
+            expand=(
+                "body.view.value,version,container,ancestors,"
+                "extensions.inlineProperties,extensions.resolution"
+            ),
             depth="all",
         )
 
@@ -747,16 +843,33 @@ class TestGetInlineComments:
         mock_adapter = MagicMock()
         mock_adapter.get_inline_comments.return_value = [
             {
-                "id": "444555666",
+                "id": "333444555",
                 "type": "comment",
                 "status": "open",
                 "body": {
                     "view": {"value": "<p>v2 inline</p>", "representation": "view"}
                 },
                 "extensions": {"location": "inline"},
+                "properties": {
+                    "inlineMarkerRef": "cloud-marker-ref",
+                    "inlineOriginalSelection": "selected cloud text",
+                },
+                "resolutionStatus": "open",
                 "version": {"number": 1},
                 "_links": {},
-            }
+            },
+            {
+                "id": "444555666",
+                "type": "comment",
+                "status": "open",
+                "parentCommentId": "333444555",
+                "body": {
+                    "view": {"value": "<p>v2 reply</p>", "representation": "view"}
+                },
+                "extensions": {"location": "inline"},
+                "version": {"number": 1},
+                "_links": {},
+            },
         ]
         comments_mixin.preprocessor.process_html_content.return_value = (
             "<p>v2 inline</p>",
@@ -770,10 +883,50 @@ class TestGetInlineComments:
         ):
             result = comments_mixin.get_inline_comments("12345")
 
-        assert len(result) == 1
+        assert len(result) == 2
+        assert result[0].parent_comment_id is None
+        assert result[0].marker_ref == "cloud-marker-ref"
+        assert result[0].original_selection == "selected cloud text"
+        assert result[0].resolution_status == "open"
+        assert result[1].parent_comment_id == result[0].id
+        assert result[1].location == "inline"
         mock_adapter.get_inline_comments.assert_called_once_with("12345")
         # v1 API should not be called
         comments_mixin.confluence.get_page_comments.assert_not_called()
+
+    def test_get_inline_comments_paginates_v1_results(self, comments_mixin_dc):
+        """Server/DC inline comments include matches beyond the first page."""
+        comments_mixin_dc.confluence.get_page_by_id.return_value = {
+            "space": {"key": "TEST"}
+        }
+        footer_comment = {
+            "id": "footer",
+            "body": {"view": {"value": "<p>footer</p>"}},
+            "extensions": {"location": "footer"},
+        }
+        comments_mixin_dc.confluence.get_page_comments.side_effect = [
+            {
+                "results": [footer_comment],
+                "start": 0,
+                "limit": 1,
+                "size": 1,
+                "_links": {"next": "/rest/api/content/12345/child/comment?start=1"},
+            },
+            {
+                "results": [MOCK_INLINE_COMMENT_V1_RESPONSE],
+                "start": 1,
+                "limit": 1,
+                "size": 1,
+                "_links": {},
+            },
+        ]
+
+        result = comments_mixin_dc.get_inline_comments("12345")
+
+        assert [comment.id for comment in result] == ["333444555"]
+        second_call = comments_mixin_dc.confluence.get_page_comments.call_args_list[1]
+        assert second_call.kwargs["start"] == 1
+        assert second_call.kwargs["limit"] == 1
 
     def test_get_inline_comments_empty(self, comments_mixin_dc):
         """get_inline_comments returns empty list if no inline comments (Server/DC)."""
@@ -1036,3 +1189,370 @@ class TestInlineCommentModel:
         assert comment.body == "<p>This is a v2 inline comment</p>"
         assert comment.author is not None
         assert comment.author.display_name == "Test User"
+
+
+class TestCommentsMixinCloudOAuthRead:
+    """Comment reads on Cloud OAuth go through the v2 API.
+
+    Atlassian answers 410 Gone for the v1 page and ``child/comment`` reads on
+    the OAuth gateway. The old path caught that error and returned an empty
+    list, so a page with comments looked uncommented.
+    """
+
+    @pytest.fixture
+    def oauth_comments_mixin(self, oauth_confluence_client):
+        """Create a CommentsMixin configured for Cloud OAuth."""
+        with patch(
+            "mcp_atlassian.confluence.comments.ConfluenceClient.__init__"
+        ) as mock_init:
+            mock_init.return_value = None
+            mixin = CommentsMixin()
+            mixin.confluence = oauth_confluence_client.confluence
+            mixin.config = oauth_confluence_client.config
+            mixin.preprocessor = oauth_confluence_client.preprocessor
+            return mixin
+
+    def test_get_page_comments_uses_v2_on_cloud_oauth(self, oauth_comments_mixin):
+        """Footer and inline comments come from v2; the v1 reads are not made."""
+        adapter = MagicMock()
+        adapter.get_page.return_value = {"id": "1", "space": {"key": "FDE"}}
+        adapter.get_footer_comments.return_value = [
+            {
+                "id": "1288142878",
+                "type": "comment",
+                "status": "current",
+                "title": "Re: Page",
+                "body": {"view": {"value": "<p>Footer</p>", "representation": "view"}},
+                "version": {"number": 1, "createdAt": "2026-10-19T11:45:01.000Z"},
+                "extensions": {"location": "footer"},
+            }
+        ]
+        adapter.get_inline_comments.return_value = [
+            {
+                "id": "1306492931",
+                "type": "comment",
+                "status": "current",
+                "title": "Re: Page",
+                "body": {"view": {"value": "<p>Inline</p>", "representation": "view"}},
+                "version": {"number": 1, "createdAt": "2026-10-19T11:45:01.000Z"},
+                "extensions": {"location": "inline"},
+            }
+        ]
+        with patch(
+            "mcp_atlassian.confluence.comments.ConfluenceV2Adapter",
+            return_value=adapter,
+        ):
+            result = oauth_comments_mixin.get_page_comments("1")
+
+        adapter.get_page.assert_called_once_with("1")
+        adapter.get_footer_comments.assert_called_once_with("1")
+        adapter.get_inline_comments.assert_called_once_with("1")
+        oauth_comments_mixin.confluence.get_page_by_id.assert_not_called()
+        oauth_comments_mixin.confluence.get_page_comments.assert_not_called()
+        assert [c.id for c in result] == ["1288142878", "1306492931"]
+        oauth_comments_mixin.preprocessor.process_html_content.assert_any_call(
+            "<p>Footer</p>",
+            space_key="FDE",
+            confluence_client=oauth_comments_mixin.confluence,
+        )
+
+    def test_get_page_comments_v2_failure_returns_empty(self, oauth_comments_mixin):
+        """An adapter failure still degrades to an empty list, as before."""
+        adapter = MagicMock()
+        adapter.get_page.return_value = {"id": "1", "space": {"key": "FDE"}}
+        adapter.get_footer_comments.side_effect = ValueError("boom")
+        with patch(
+            "mcp_atlassian.confluence.comments.ConfluenceV2Adapter",
+            return_value=adapter,
+        ):
+            assert oauth_comments_mixin.get_page_comments("1") == []
+
+
+class _RecordingV2Session:
+    """Fake v2 session: N root footer and inline comments, one reply each.
+
+    Pages hold two results and point to the next page with a cursor, so the
+    request count shows how much of the collection a read walks.
+    """
+
+    PAGE_SIZE = 2
+
+    def __init__(self, roots: int, *, runaway: bool = False) -> None:
+        self.roots = roots
+        self.runaway = runaway
+        self.urls: list[str] = []
+
+    def _items(self, url: str) -> list[dict]:
+        if url.endswith("/children"):
+            parent = url.rsplit("/", 2)[-2]
+            return [_v2_comment(f"{parent}-r")] if "-r" not in parent else []
+        kind = "f" if "footer" in url else "i"
+        return [_v2_comment(f"{kind}{n}") for n in range(self.roots)]
+
+    def get(self, url: str, params: dict | None = None, **_: object) -> MagicMock:
+        self.urls.append(url)
+        if len(self.urls) > 2000:
+            raise AssertionError("unbounded read")
+        response = MagicMock()
+        response.links = {}
+        if url.endswith("/pages/1"):
+            data: dict = {"id": "1", "title": "Page", "spaceId": "9"}
+        else:
+            offset = int((params or {}).get("cursor") or 0)
+            items = self._items(url)
+            data = {"results": items[offset : offset + self.PAGE_SIZE]}
+            if self.runaway or offset + self.PAGE_SIZE < len(items):
+                data["_links"] = {"next": f"{url}?cursor={offset + self.PAGE_SIZE}"}
+        response.json.return_value = data
+        return response
+
+
+def _v2_comment(comment_id: str) -> dict:
+    return {
+        "id": comment_id,
+        "status": "current",
+        "body": {"storage": {"value": f"<p>{comment_id}</p>"}},
+        "version": {"number": 1, "createdAt": "2026-01-01T00:00:00Z"},
+    }
+
+
+def _cloud_oauth_comments_mixin(session: _RecordingV2Session) -> CommentsMixin:
+    mixin = CommentsMixin.__new__(CommentsMixin)
+    mixin.config = MagicMock()
+    mixin.config.is_cloud = True
+    mixin.config.auth_type = "oauth"
+    mixin.config.url = "https://api.atlassian.com/ex/confluence/site"
+    mixin.confluence = MagicMock()
+    mixin.confluence._session = session
+    mixin.confluence.url = "https://api.atlassian.com/ex/confluence/site"
+    mixin.preprocessor = ConfluencePreprocessor(base_url=mixin.config.url)
+    return mixin
+
+
+async def _call_get_comments_tool(fetcher: CommentsMixin) -> list[dict]:
+    from fastmcp import Client, FastMCP
+    from fastmcp.client import FastMCPTransport
+
+    from mcp_atlassian.servers import confluence as confluence_tools
+
+    mcp = FastMCP("comments-test")
+    mcp.add_tool(confluence_tools.get_comments)
+    with patch.object(
+        confluence_tools, "get_confluence_fetcher", AsyncMock(return_value=fetcher)
+    ):
+        async with Client(transport=FastMCPTransport(mcp)) as client:
+            result = await client.call_tool("get_comments", {"page_id": "1"})
+    return json.loads(result.content[0].text)
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_bounds_comments_and_requests():
+    """A page with many threads costs a bounded number of requests."""
+    from mcp_atlassian.confluence.v2_adapter import (
+        MAX_COMMENT_REQUESTS_PER_READ,
+        MAX_COMMENTS_PER_READ,
+    )
+
+    session = _RecordingV2Session(roots=500)
+    comments = await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    # Footer and inline collections are each one bounded read.
+    assert len(comments) <= 2 * MAX_COMMENTS_PER_READ
+    comment_requests = [u for u in session.urls if "comments" in u]
+    assert len(comment_requests) <= 2 * MAX_COMMENT_REQUESTS_PER_READ
+    assert comments, "the first comments are still returned"
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_small_page_is_complete():
+    """Pages under the limits return every comment and reply."""
+    session = _RecordingV2Session(roots=3)
+    comments = await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    assert len(comments) == 12  # 3 roots + 3 replies, footer and inline
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_stops_runaway_cursor():
+    """A cursor that never ends stops at the request limit."""
+    from mcp_atlassian.confluence.v2_adapter import MAX_COMMENT_REQUESTS_PER_READ
+
+    session = _RecordingV2Session(roots=1, runaway=True)
+    await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    comment_requests = [u for u in session.urls if "comments" in u]
+    assert len(comment_requests) <= 2 * MAX_COMMENT_REQUESTS_PER_READ
+
+
+def test_v1_comment_listing_stops_at_item_limit():
+    """The Server/DC listing stops paging once the item limit is reached."""
+    from mcp_atlassian.confluence.v2_adapter import MAX_COMMENTS_PER_READ
+
+    mixin = CommentsMixin.__new__(CommentsMixin)
+    mixin.confluence = MagicMock()
+    calls: list[int] = []
+
+    def page(**kwargs: Any) -> dict:
+        start = int(kwargs.get("start", 0) or 0)
+        calls.append(start)
+        if len(calls) > 1000:
+            raise AssertionError("unbounded read")
+        return {
+            "results": [{"id": str(start + i)} for i in range(25)],
+            "start": start,
+            "size": 25,
+            "limit": 25,
+            "_links": {"next": "/next"},
+        }
+
+    mixin.confluence.get_page_comments.side_effect = page
+    results = mixin._get_all_v1_page_comments("1", expand="body.view.value")
+
+    assert len(results) == MAX_COMMENTS_PER_READ
+    assert len(calls) == -(-MAX_COMMENTS_PER_READ // 25)
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_marks_truncated_list():
+    """A cut-short read ends the list with one truncation marker item."""
+    session = _RecordingV2Session(roots=500)
+    comments = await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    assert comments[-1]["truncated"] is True
+    assert comments[-1]["message"]
+    assert all("truncated" not in c for c in comments[:-1])
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_complete_list_has_no_marker():
+    session = _RecordingV2Session(roots=3)
+    comments = await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    assert all("truncated" not in c for c in comments)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("roots", "truncated"), [(500, True), (3, False)])
+async def test_get_inline_comments_tool_reports_truncation(roots, truncated):
+    from fastmcp import Client, FastMCP
+    from fastmcp.client import FastMCPTransport
+
+    from mcp_atlassian.servers import confluence as confluence_tools
+
+    fetcher = _cloud_oauth_comments_mixin(_RecordingV2Session(roots=roots))
+    mcp = FastMCP("inline-comments-test")
+    mcp.add_tool(confluence_tools.get_inline_comments)
+    with patch.object(
+        confluence_tools, "get_confluence_fetcher", AsyncMock(return_value=fetcher)
+    ):
+        async with Client(transport=FastMCPTransport(mcp)) as client:
+            result = await client.call_tool("get_inline_comments", {"page_id": "1"})
+    body = json.loads(result.content[0].text)
+
+    assert body["success"] is True
+    assert body.get("truncated", False) is truncated
+    assert ("hint" in body) is truncated
+
+
+@pytest.mark.parametrize(
+    ("total", "endless", "truncated"),
+    [
+        (200, False, False),
+        (200, True, True),
+        (199, False, False),
+    ],
+)
+def test_v1_comment_listing_marks_more_comments(total, endless, truncated):
+    """Stopping exactly at the item limit is truncation only if more remain."""
+    from mcp_atlassian.utils.truncation import is_truncated
+
+    mixin = CommentsMixin.__new__(CommentsMixin)
+    mixin.confluence = MagicMock()
+
+    def page(**kwargs: Any) -> dict:
+        start = int(kwargs.get("start", 0) or 0)
+        if start > 10_000:
+            raise AssertionError("unbounded read")
+        count = 25 if endless else max(0, min(25, total - start))
+        more = endless or start + count < total
+        response = {
+            "results": [{"id": str(start + i)} for i in range(count)],
+            "start": start,
+            "size": count,
+            "limit": 25,
+            "_links": {"next": "/next"} if more else {},
+        }
+        return response
+
+    mixin.confluence.get_page_comments.side_effect = page
+    results = mixin._get_all_v1_page_comments("1", expand="body.view.value")
+
+    assert len(results) == min(total, 200)
+    assert is_truncated(results) is truncated
+
+
+class _ConfigurableV2Session(_RecordingV2Session):
+    """Like _RecordingV2Session, with a page size, replies and a stuck cursor."""
+
+    def __init__(
+        self,
+        roots: int,
+        *,
+        page_size: int = 2,
+        replies: bool = True,
+        stuck_cursor: bool = False,
+    ) -> None:
+        super().__init__(roots)
+        self.PAGE_SIZE = page_size
+        self.replies = replies
+        self.stuck_cursor = stuck_cursor
+
+    def _items(self, url: str) -> list[dict]:
+        if url.endswith("/children") and not self.replies:
+            return []
+        return super()._items(url)
+
+    def get(self, url: str, params: dict | None = None, **_: object) -> MagicMock:
+        if self.stuck_cursor and "footer-comments" in url and "/children" not in url:
+            self.urls.append(url)
+            if len(self.urls) > 2000:
+                raise AssertionError("unbounded read")
+            response = MagicMock()
+            response.links = {}
+            response.json.return_value = {
+                "results": [],
+                "_links": {"next": f"{url}?cursor=stuck"},
+            }
+            return response
+        return super().get(url, params)
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_reports_repeated_cursor():
+    """A stuck cursor ends the list with a 'may have more' marker."""
+    session = _ConfigurableV2Session(roots=0, stuck_cursor=True)
+    comments = await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    assert comments[-1]["truncated"] is True
+    assert "may" in comments[-1]["message"]
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_unchecked_replies_say_may():
+    """Replies left unchecked are reported as possible, not certain."""
+    session = _ConfigurableV2Session(roots=200, page_size=250, replies=False)
+    comments = await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    assert comments[-1]["truncated"] is True
+    assert "may" in comments[-1]["message"]
+
+
+@pytest.mark.anyio
+async def test_get_comments_tool_certain_truncation_says_more():
+    """Comments seen past the limit are reported as certainly missing."""
+    session = _ConfigurableV2Session(roots=250, page_size=250, replies=False)
+    comments = await _call_get_comments_tool(_cloud_oauth_comments_mixin(session))
+
+    assert comments[-1]["truncated"] is True
+    assert "may" not in comments[-1]["message"]
+    assert "has more" in comments[-1]["message"]

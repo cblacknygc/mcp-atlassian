@@ -167,6 +167,46 @@ class TestConfluenceDCAttachments:
         if "version" in matching[0]:
             assert matching[0]["version"]["number"] >= 2
 
+    def test_upload_keeps_a_comma_in_the_comment(
+        self,
+        confluence_fetcher: ConfluenceFetcher,
+        dc_instance: DCInstanceInfo,
+        resource_tracker: DCResourceTracker,
+    ) -> None:
+        """A comment with a comma is stored as written, on create and re-upload."""
+        uid = uuid.uuid4().hex[:8]
+        page = confluence_fetcher.create_page(
+            space_key=dc_instance.space_key,
+            title=f"E2E Attachment Comment {uid}",
+            body="<p>For attachment comment testing.</p>",
+        )
+        resource_tracker.add_confluence_page(page.id)
+        filename = f"comma-{uid}.txt"
+
+        for version, (content, comment) in enumerate(
+            (
+                (b"first", "redrawn diagram (chain registry, broker)"),
+                (b"second", "second pass, with more, commas"),
+            ),
+            start=1,
+        ):
+            result = confluence_fetcher.upload_attachment_from_content(
+                content_id=page.id,
+                filename=filename,
+                content=content,
+                comment=comment,
+            )
+            assert result["success"] is True, result
+            assert "warning" not in result
+
+            stored = confluence_fetcher.confluence.get_attachments_from_content(
+                page.id, filename=filename, expand="version,metadata"
+            )["results"]
+            assert len(stored) == 1
+            assert stored[0]["metadata"]["comment"] == comment
+            # Setting the comment must not add an attachment version.
+            assert stored[0]["version"]["number"] == version
+
 
 class TestConfluenceDCPageHierarchy:
     """Page hierarchy (parent/child pages)."""
@@ -235,6 +275,44 @@ class TestConfluenceDCPageLayout:
         storage_body = raw_page["body"]["storage"]["value"]
         assert 'data-layout="full-width"' in storage_body
         assert 'data-table-width="1800"' in storage_body
+
+
+class TestConfluenceDCPagePropertyRemoval:
+    """Page property removal handling."""
+
+    def test_remove_page_emoji_and_width(
+        self,
+        confluence_fetcher: ConfluenceFetcher,
+        dc_instance: DCInstanceInfo,
+        resource_tracker: DCResourceTracker,
+    ) -> None:
+        uid = uuid.uuid4().hex[:8]
+        page = confluence_fetcher.create_page(
+            space_key=dc_instance.space_key,
+            title=f"E2E Property Removal Test {uid}",
+            body="<p>Property removal test.</p>",
+            is_markdown=False,
+            content_representation="storage",
+            emoji="📄",
+            page_width="full-width",
+        )
+        resource_tracker.add_confluence_page(page.id)
+
+        assert page.emoji
+        assert page.page_width == "full-width"
+
+        updated = confluence_fetcher.update_page(
+            page.id,
+            page.title,
+            "<p>Property removal test, updated.</p>",
+            is_markdown=False,
+            content_representation="storage",
+            emoji="",
+            page_width="",
+        )
+
+        assert updated.emoji is None
+        assert updated.page_width is None
 
 
 class TestConfluenceDCCopyAndRestrictions:

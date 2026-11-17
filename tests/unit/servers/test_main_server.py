@@ -7,8 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from key_value.aio.stores.memory import MemoryStore
 
-from mcp_atlassian.servers.main import UserTokenMiddleware, main_mcp
+from mcp_atlassian.servers.main import AtlassianMCP, UserTokenMiddleware, main_mcp
+from mcp_atlassian.servers.oauth_proxy import HardenedOAuthProxy
+from mcp_atlassian.utils.token_verifier import AtlassianOpaqueTokenVerifier
 
 
 @pytest.mark.anyio
@@ -172,6 +175,97 @@ async def test_streamable_http_path_is_normalized_without_trailing_slash():
     assert app.state.path == "/mcp"
 
 
+@pytest.mark.parametrize(
+    ("transport", "path", "expected_paths", "expected_mounts"),
+    [
+        ("http", "/http-alias/", {"/http-alias"}, set()),
+        ("streamable-http", "/custom-mcp/", {"/custom-mcp"}, set()),
+        ("sse", "/custom-sse/", {"/custom-sse"}, {"/messages"}),
+    ],
+)
+def test_http_app_configures_auth_for_transport_endpoints(
+    transport, path, expected_paths, expected_mounts
+):
+    app = main_mcp.http_app(transport=transport, path=path)
+    middleware = next(
+        item for item in app.user_middleware if item.cls is UserTokenMiddleware
+    )
+
+    assert middleware.kwargs["auth_paths"] == frozenset(expected_paths)
+    assert middleware.kwargs["auth_mounts"] == frozenset(expected_mounts)
+
+
+_ALL_METHODS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+
+@pytest.mark.security_regression
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", _ALL_METHODS)
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/sse",
+        "/sse/",
+        "/messages",
+        "/messages/",
+        "/messages/?session_id=missing",
+        "/messages/extra",
+    ],
+)
+async def test_sse_app_rejects_unauthenticated_requests_for_every_method(
+    method, path, monkeypatch
+):
+    monkeypatch.delenv("ALLOW_GLOBAL_CRED_FALLBACK", raising=False)
+    monkeypatch.delenv("IGNORE_HEADER_AUTH", raising=False)
+    app = main_mcp.http_app(transport="sse")
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.request(method, path)
+
+    assert response.status_code == 401
+
+
+@pytest.mark.security_regression
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", _ALL_METHODS)
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+async def test_streamable_http_app_rejects_unauthenticated_requests_for_every_method(
+    method, path, monkeypatch
+):
+    monkeypatch.delenv("ALLOW_GLOBAL_CRED_FALLBACK", raising=False)
+    monkeypatch.delenv("IGNORE_HEADER_AUTH", raising=False)
+    app = main_mcp.http_app(transport="streamable-http")
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.request(
+            method,
+            path,
+            headers={
+                "accept": "application/json, text/event-stream",
+                "mcp-session-id": "0123456789abcdef0123456789abcdef",
+            },
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("transport_name", ["sse", "streamable-http"])
+async def test_transport_auth_gate_leaves_health_check_open(
+    transport_name, monkeypatch
+):
+    monkeypatch.delenv("ALLOW_GLOBAL_CRED_FALLBACK", raising=False)
+    app = main_mcp.http_app(transport=transport_name)
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/healthz")
+
+    assert response.status_code == 200
+
+
 class TestUserTokenMiddleware:
     """Tests for the UserTokenMiddleware class."""
 
@@ -183,6 +277,7 @@ class TestUserTokenMiddleware:
         mock_mcp_server = MagicMock()
         mock_mcp_server.settings.streamable_http_path = "/mcp"
         mock_mcp_server.get_streamable_http_path.return_value = "/mcp"
+        mock_mcp_server.auth = None
         return UserTokenMiddleware(mock_app, mcp_server_ref=mock_mcp_server)
 
     @pytest.fixture
@@ -317,6 +412,22 @@ class TestUserTokenMiddleware:
         assert "username=test" not in caplog.text
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("scheme", ["Bearer", "Token"])
+    async def test_accepted_token_leaves_no_fragment_in_debug_log(
+        self, middleware, mock_scope, mock_receive, mock_send, caplog, scheme
+    ):
+        """An accepted token is logged by length only, with no characters of it."""
+        token = "abcdefgh-0123456789-middle-0123456789-stuvwxyz"
+        mock_scope["headers"] = [(b"authorization", f"{scheme} {token}".encode())]
+
+        with caplog.at_level(logging.DEBUG, logger="mcp-atlassian.server.main"):
+            await middleware(mock_scope, mock_receive, mock_send)
+
+        assert "token extracted" in caplog.text
+        assert token[:8] not in caplog.text
+        assert token[-8:] not in caplog.text
+
+    @pytest.mark.anyio
     async def test_raw_auth_token_is_redacted_in_warning(
         self, middleware, mock_scope, mock_receive, mock_send, caplog
     ):
@@ -363,7 +474,7 @@ class TestUserTokenMiddleware:
     @pytest.mark.security_regression
     @pytest.mark.anyio
     async def test_missing_authorization_header_returns_401(
-        self, middleware, mock_scope, mock_receive, mock_send
+        self, middleware, mock_scope, mock_receive, mock_send, monkeypatch
     ):
         """An unauthenticated POST to the MCP endpoint must be rejected at the
         transport boundary, not proxied to the app with the operator's credentials.
@@ -373,6 +484,7 @@ class TestUserTokenMiddleware:
         Authorization header and ``ALLOW_GLOBAL_CRED_FALLBACK`` off, return 401 and do
         not call ``self.app``.
         """
+        monkeypatch.setenv("ALLOW_GLOBAL_CRED_FALLBACK", "false")
         # No Authorization header and no service headers -> unauthenticated request.
         mock_scope["headers"] = []
 
@@ -384,6 +496,20 @@ class TestUserTokenMiddleware:
         start_call = mock_send.call_args_list[0][0][0]
         assert start_call["type"] == "http.response.start"
         assert start_call["status"] == 401
+
+    @pytest.mark.security_regression
+    @pytest.mark.anyio
+    async def test_oauth_provider_missing_authorization_defers_to_app(
+        self, middleware, mock_scope, mock_receive, mock_send
+    ):
+        """An OAuth-protected request must reach FastMCP for its challenge."""
+        middleware.mcp_server_ref.auth = MagicMock()
+        mock_scope["headers"] = []
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        middleware.app.assert_called_once()
+        mock_send.assert_not_called()
 
     @pytest.mark.anyio
     async def test_client_disconnect_connection_reset(
@@ -634,6 +760,138 @@ class TestUserTokenMiddleware:
             is True
         )
 
+    @pytest.mark.parametrize(
+        ("method", "path", "expected"),
+        [
+            ("GET", "/custom-sse/", True),
+            ("HEAD", "/custom-sse", True),
+            ("POST", "/messages/", True),
+            ("PUT", "/messages", True),
+            ("DELETE", "/messages/extra", True),
+            ("GET", "/custom-mcp", True),
+            ("DELETE", "/custom-mcp/", True),
+            ("GET", "/messagesx", False),
+            ("GET", "/healthz", False),
+            ("POST", "/unrelated", False),
+        ],
+    )
+    def test_should_process_auth_matches_paths_for_every_method(
+        self, middleware, method, path, expected
+    ):
+        middleware.auth_paths = frozenset({"/custom-sse", "/custom-mcp"})
+        middleware.auth_mounts = frozenset({"/messages"})
+
+        assert (
+            middleware._should_process_auth(
+                {"type": "http", "method": method, "path": path}
+            )
+            is expected
+        )
+
+    @pytest.mark.anyio
+    async def test_missing_auth_is_allowed_when_global_fallback_is_enabled(
+        self, middleware, mock_scope, mock_receive, mock_send, monkeypatch
+    ):
+        monkeypatch.setenv("ALLOW_GLOBAL_CRED_FALLBACK", "true")
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        middleware.app.assert_called_once()
+        mock_send.assert_not_called()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "cloud_id",
+        [
+            "../../admin",
+            "abc/def",
+            "abc?x=1",
+            "abc#frag",
+            "abc%2F..",
+            "-leading-hyphen",
+            "a" * 129,
+        ],
+    )
+    async def test_invalid_cloud_id_header_is_rejected(
+        self, middleware, mock_scope, mock_receive, mock_send, cloud_id
+    ):
+        mock_scope["headers"] = [
+            (b"authorization", b"Bearer user-token"),
+            (b"x-atlassian-cloud-id", cloud_id.encode()),
+        ]
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        start_call = mock_send.call_args_list[0][0][0]
+        assert start_call["status"] == 401
+        middleware.app.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_uuid_cloud_id_header_is_accepted(
+        self, middleware, mock_scope, mock_receive, mock_send
+    ):
+        cloud_id = "1324a887-45db-1bf4-1e99-ef0ff456d421"
+        mock_scope["headers"] = [
+            (b"authorization", b"Bearer user-token"),
+            (b"x-atlassian-cloud-id", f" {cloud_id} ".encode()),
+        ]
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        middleware.app.assert_called_once()
+        passed_scope = middleware.app.call_args[0][0]
+        assert passed_scope["state"]["user_atlassian_cloud_id"] == cloud_id
+
+    @pytest.mark.parametrize("method", ["GET", "DELETE", "HEAD"])
+    def test_should_process_auth_default_path_covers_every_method(
+        self, middleware, method
+    ):
+        assert (
+            middleware._should_process_auth(
+                {"type": "http", "method": method, "path": "/mcp"}
+            )
+            is True
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["GET", "DELETE"])
+    async def test_streamable_get_and_delete_without_credentials_return_401(
+        self, middleware, mock_scope, mock_receive, mock_send, method, monkeypatch
+    ):
+        monkeypatch.delenv("ALLOW_GLOBAL_CRED_FALLBACK", raising=False)
+        monkeypatch.delenv("IGNORE_HEADER_AUTH", raising=False)
+        mock_scope["method"] = method
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        start_call = mock_send.call_args_list[0][0][0]
+        assert start_call["status"] == 401
+        middleware.app.assert_not_called()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("method", "path"), [("GET", "/sse"), ("PUT", "/messages/")]
+    )
+    async def test_sse_transport_processes_valid_authentication(
+        self, middleware, mock_scope, mock_receive, mock_send, method, path
+    ):
+        middleware.auth_paths = frozenset({"/sse"})
+        middleware.auth_mounts = frozenset({"/messages"})
+        mock_scope.update(
+            {
+                "method": method,
+                "path": path,
+                "headers": [(b"authorization", b"Bearer user-token")],
+            }
+        )
+
+        await middleware(mock_scope, mock_receive, mock_send)
+
+        middleware.app.assert_called_once()
+        passed_scope = middleware.app.call_args[0][0]
+        assert passed_scope["state"]["user_atlassian_token"] == "user-token"
+        assert passed_scope["state"]["user_atlassian_auth_type"] == "oauth"
+
     @pytest.mark.anyio
     @pytest.mark.parametrize(
         "env_value,should_skip",
@@ -818,3 +1076,243 @@ class TestUserTokenMiddlewareSsrfValidation:
         middleware.app.assert_called_once()
         passed_scope = middleware.app.call_args[0][0]
         assert passed_scope["state"].get("auth_validation_error") in (None, "")
+
+
+@pytest.mark.security_regression
+@pytest.mark.anyio
+async def test_oauth_provider_missing_credentials_returns_discovery_challenge(
+    monkeypatch,
+):
+    """FastMCP returns RFC 9728 discovery metadata for missing credentials."""
+    monkeypatch.setenv("ALLOW_GLOBAL_CRED_FALLBACK", "false")
+    provider = HardenedOAuthProxy(
+        upstream_authorization_endpoint="https://idp.invalid/authorize",
+        upstream_token_endpoint="https://idp.invalid/token",
+        upstream_client_id="test-client",
+        upstream_client_secret="test-secret",
+        token_verifier=AtlassianOpaqueTokenVerifier(required_scopes=["read:jira"]),
+        base_url="https://testserver",
+        client_storage=MemoryStore(),
+        require_authorization_consent=False,
+    )
+    server = AtlassianMCP("oauth-challenge-test", auth=provider)
+    app = server.http_app(path="/mcp", stateless_http=True)
+    transport = httpx.ASGITransport(app=app)
+    initialize_request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "test-client", "version": "1"},
+        },
+    }
+
+    with patch.object(
+        server._mcp_server, "run", new_callable=AsyncMock
+    ) as mock_mcp_run:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="https://testserver"
+        ) as client:
+            response = await client.post(
+                "/mcp",
+                headers={
+                    "accept": "application/json, text/event-stream",
+                    "content-type": "application/json",
+                },
+                json=initialize_request,
+            )
+            invalid = await client.post(
+                "/mcp",
+                headers={
+                    "accept": "application/json, text/event-stream",
+                    "authorization": "Bearer not-a-valid-token",
+                    "content-type": "application/json",
+                },
+                json=initialize_request,
+            )
+            metadata = await client.get("/.well-known/oauth-protected-resource/mcp")
+
+    assert response.status_code == 401
+    challenge = response.headers["www-authenticate"]
+    assert challenge.startswith("Bearer ")
+    assert 'scope="read:jira"' in challenge
+    assert (
+        'resource_metadata="https://testserver/'
+        '.well-known/oauth-protected-resource/mcp"' in challenge
+    )
+    assert invalid.status_code == 401
+    assert 'error="invalid_token"' in invalid.headers["www-authenticate"]
+    mock_mcp_run.assert_not_awaited()
+    assert metadata.status_code == 200
+    metadata_body = metadata.json()
+    assert metadata_body["resource"] == "https://testserver/mcp"
+    assert metadata_body["authorization_servers"] == ["https://testserver/"]
+
+
+@pytest.mark.security_regression
+@pytest.mark.parametrize("transport_name", ["sse", "streamable-http", "http"])
+def test_http_app_confines_file_paths_without_cli(transport_name, monkeypatch):
+    """An ASGI server that imports the app directly gets the remote file root."""
+    from mcp_atlassian.utils import io as io_mod
+
+    monkeypatch.delenv(io_mod.FILES_DIR_ENV, raising=False)
+    io_mod.set_remote_transport(False)
+
+    main_mcp.http_app(transport=transport_name)
+
+    assert io_mod.get_file_root() == io_mod.default_files_dir().resolve()
+
+
+@pytest.mark.security_regression
+def test_http_app_refuses_wide_file_root(monkeypatch):
+    from mcp_atlassian.utils import io as io_mod
+
+    monkeypatch.setenv(io_mod.FILES_DIR_ENV, "/")
+    with pytest.raises(ValueError, match="filesystem root"):
+        main_mcp.http_app(transport="streamable-http")
+
+
+@pytest.mark.security_regression
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("transport_name", "path"),
+    [
+        ("sse", "/prefix/sse"),
+        ("sse", "/prefix/messages/"),
+        ("sse", "/prefix/messages/sub"),
+        ("streamable-http", "/prefix/mcp"),
+        ("streamable-http", "/prefix/mcp/"),
+    ],
+)
+async def test_auth_gate_applies_under_root_path(transport_name, path, monkeypatch):
+    """With root_path set, the router strips the prefix; so must the gate."""
+    monkeypatch.delenv("ALLOW_GLOBAL_CRED_FALLBACK", raising=False)
+    monkeypatch.delenv("IGNORE_HEADER_AUTH", raising=False)
+    app = main_mcp.http_app(transport=transport_name)
+    transport = httpx.ASGITransport(app=app, root_path="/prefix")
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            path, headers={"accept": "application/json, text/event-stream"}
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"path": "/mcp", "root_path": ""},
+        {"path": "/prefix/mcp", "root_path": "/prefix"},
+        {"path": "/prefix", "root_path": "/prefix"},
+        {"path": "/prefixed/mcp", "root_path": "/prefix"},
+        {"path": "/other/mcp", "root_path": "/prefix"},
+    ],
+)
+def test_route_path_matches_starlette_router(scope):
+    from starlette._utils import get_route_path
+
+    from mcp_atlassian.servers.main import _route_path
+
+    assert _route_path(scope) == get_route_path(scope)
+
+
+class TestUserTokenMiddlewareUrlHeaderDns:
+    """URL-header DNS checks never run on the event loop.
+
+    ``socket.getaddrinfo`` is replaced by a stub that blocks until a sibling
+    coroutine releases it; a lookup on the loop thread would starve the
+    sibling and the stub would report that it timed out.
+    """
+
+    @pytest.fixture
+    def middleware(self):
+        mock_app = AsyncMock()
+        mock_mcp_server = MagicMock()
+        mock_mcp_server.auth = None
+        mock_mcp_server.get_streamable_http_path.return_value = "/mcp"
+        return UserTokenMiddleware(mock_app, mcp_server_ref=mock_mcp_server)
+
+    @staticmethod
+    def _scope(headers):
+        return {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp",
+            "headers": headers,
+            "state": {},
+        }
+
+    @pytest.mark.anyio
+    async def test_url_header_lookup_runs_off_the_event_loop(
+        self, middleware, monkeypatch
+    ):
+        import threading
+
+        import anyio
+
+        from mcp_atlassian.utils import urls
+
+        monkeypatch.delenv("MCP_ALLOWED_URL_DOMAINS", raising=False)
+        entered, release = threading.Event(), threading.Event()
+        record: dict[str, object] = {}
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            record["thread"] = threading.get_ident()
+            entered.set()
+            record["released"] = release.wait(5.0)
+            return [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(urls.socket, "getaddrinfo", fake_getaddrinfo)
+
+        async def sibling():
+            while not entered.is_set():
+                await anyio.sleep(0.001)
+            release.set()
+
+        scope = self._scope(
+            [
+                (b"authorization", b"Token jira-pat"),
+                (b"x-atlassian-jira-personal-token", b"jira-pat"),
+                (b"x-atlassian-jira-url", b"https://jira.example.test"),
+            ]
+        )
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(sibling)
+            await middleware(scope, AsyncMock(), AsyncMock())
+            tg.cancel_scope.cancel()
+
+        assert entered.is_set()
+        assert record["thread"] != threading.get_ident()
+        assert record["released"] is True
+
+    @pytest.mark.anyio
+    async def test_url_headers_without_credentials_trigger_no_lookup(
+        self, middleware, monkeypatch
+    ):
+        from mcp_atlassian.utils import urls
+
+        monkeypatch.delenv("MCP_ALLOWED_URL_DOMAINS", raising=False)
+        monkeypatch.delenv("ALLOW_GLOBAL_CRED_FALLBACK", raising=False)
+        lookups: list[str] = []
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            lookups.append(host)
+            return [(2, 1, 6, "", ("93.184.216.34", 0))]
+
+        monkeypatch.setattr(urls.socket, "getaddrinfo", fake_getaddrinfo)
+        send = AsyncMock()
+        scope = self._scope(
+            [
+                (b"x-atlassian-jira-url", b"https://jira.example.test"),
+                (b"x-atlassian-confluence-url", b"https://wiki.example.test"),
+            ]
+        )
+
+        await middleware(scope, AsyncMock(), send)
+
+        assert lookups == []
+        start = send.call_args_list[0].args[0]
+        assert start["status"] == 401

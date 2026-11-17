@@ -22,12 +22,16 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
 
     _field_name_to_id_map: dict[str, str] | None = None  # Cache for name -> id mapping
 
-    def get_fields(self, refresh: bool = False) -> list[dict[str, Any]]:
+    def get_fields(
+        self, refresh: bool = False, *, raise_errors: bool = False
+    ) -> list[dict[str, Any]]:
         """
         Get all available fields from Jira.
 
         Args:
             refresh: When True, forces a refresh from the server instead of using cache
+            raise_errors: When True, a failed lookup raises instead of returning
+                an empty list, so callers can tell "no fields" from "unknown".
 
         Returns:
             List of field definitions
@@ -62,6 +66,8 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
 
         except Exception as e:
             logger.error(f"Error getting Jira fields: {str(e)}")
+            if raise_errors:
+                raise
             return []
 
     def _generate_field_map(self, force_regenerate: bool = False) -> dict[str, str]:
@@ -183,7 +189,7 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
         Get required fields for creating an issue of a specific type in a project.
 
         Args:
-            issue_type: The issue type (e.g., 'Bug', 'Story', 'Epic')
+            issue_type: The issue type name or ID (e.g., 'Bug' or '10001')
             project_key: The project key (e.g., 'PROJ')
 
         Returns:
@@ -202,7 +208,7 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
             return self._required_fields_cache[cache_key]
 
         try:
-            # Step 1: Get the ID for the given issue type name within the project
+            # Step 1: Resolve the issue type by stable ID or display name.
             if not hasattr(self, "get_project_issue_types"):
                 logger.error(
                     "get_project_issue_types method not available. Cannot resolve issue type ID."
@@ -212,8 +218,13 @@ class FieldsMixin(JiraClient, EpicOperationsProto, UsersOperationsProto):
             all_issue_types = self.get_project_issue_types(project_key)
             issue_type_id = None
             for it in all_issue_types:
-                if it.get("name", "").lower() == issue_type.lower():
-                    issue_type_id = it.get("id")
+                candidate_id = it.get("id")
+                candidate_name = it.get("name", "")
+                if (candidate_id is not None and str(candidate_id) == issue_type) or (
+                    isinstance(candidate_name, str)
+                    and candidate_name.lower() == issue_type.lower()
+                ):
+                    issue_type_id = candidate_id
                     break
 
             if not issue_type_id:

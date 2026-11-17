@@ -9,12 +9,13 @@ from typing import Any
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import HTTPError
 
-from ..exceptions import MCPAtlassianAuthenticationError
+from ..exceptions import MCPAtlassianAuthenticationError, ScopeViolationError
 from ..models.jira import JiraIssue
 from ..models.jira.adf import merge_adf_with_preserved_media
 from ..models.jira.common import JiraChangelog
+from ..models.jira.issue import restrict_changelogs
 from ..utils import parse_date
-from .client import JiraClient
+from ..utils.truncation import merge_truncation
 from .constants import DEFAULT_READ_JIRA_FIELDS
 from .protocols import (
     AttachmentsOperationsProto,
@@ -25,15 +26,17 @@ from .protocols import (
     ProjectsOperationsProto,
     UsersOperationsProto,
 )
+from .scope import ScopeMixin, allowed_project_keys, output_scope_kwargs
 
 logger = logging.getLogger("mcp-jira")
 
 # Friendly aliases that users may pass for the epic link custom field
 _EPIC_LINK_ALIASES = frozenset({"epickey", "epic_link", "epiclink", "epic link"})
+_EPIC_NAME_FIELD_SCHEMA = "com.pyxis.greenhopper.jira:gh-epic-label"
 
 
 class IssuesMixin(
-    JiraClient,
+    ScopeMixin,
     AttachmentsOperationsProto,
     EpicOperationsProto,
     FieldsOperationsProto,
@@ -129,7 +132,7 @@ class IssuesMixin(
             # Determine fields_param: use provided fields or default from constant
             fields_param = fields
             if fields_param is None:
-                fields_param = ",".join(DEFAULT_READ_JIRA_FIELDS)
+                fields_param = ",".join(sorted(DEFAULT_READ_JIRA_FIELDS))
             elif isinstance(fields_param, list | tuple | set):
                 fields_param = ",".join(fields_param)
 
@@ -244,6 +247,9 @@ class IssuesMixin(
                             if isinstance(raw_body, str) and raw_body:
                                 comment["body"] = self._clean_text(raw_body)
 
+            # An epic outside the allowlist is neither fetched nor returned.
+            self._drop_out_of_scope_epic_link(fields_data)
+
             # Extract epic information
             try:
                 epic_info = self._extract_epic_information(issue)
@@ -283,6 +289,7 @@ class IssuesMixin(
                 issue,
                 base_url=self.config.url if hasattr(self, "config") else None,
                 requested_fields=model_fields,
+                **output_scope_kwargs(self),
             )
         except HTTPError as http_err:
             status_code = (
@@ -381,6 +388,28 @@ class IssuesMixin(
                 logger.warning(f"Error getting comments for {issue_key}: {str(e)}")
                 return []
         return []
+
+    def _drop_out_of_scope_epic_link(self, fields: dict[str, Any]) -> None:
+        """Remove an Epic Link value that points outside JIRA_PROJECTS_FILTER.
+
+        The epic is resolved to its current project before anything is read
+        from it. When it is outside the allowlist the Epic Link value is
+        removed, so the epic is not fetched and its key and name are not
+        returned.
+
+        Args:
+            fields: The ``fields`` of the issue returned by Jira (mutated).
+        """
+        if self.allowed_projects() is None:
+            return
+        field_id = self._epic_link_field_id()
+        if not field_id or not fields.get(field_id):
+            return
+        try:
+            self.ensure_issue_allowed(fields[field_id])
+        except ScopeViolationError:
+            logger.info("Dropping an Epic Link outside JIRA_PROJECTS_FILTER")
+            fields.pop(field_id, None)
 
     def _extract_epic_information(self, issue: dict) -> dict[str, str | None]:
         """
@@ -601,7 +630,7 @@ class IssuesMixin(
         issue_type: str,
         description: str = "",
         assignee: str | None = None,
-        components: list[str] | None = None,
+        components: list[str | dict[str, Any]] | None = None,
         **kwargs: Any,  # noqa: ANN401 - Dynamic field types are necessary for Jira API
     ) -> JiraIssue:
         """
@@ -613,7 +642,8 @@ class IssuesMixin(
             issue_type: The type of issue to create
             description: The issue description
             assignee: The username or account ID of the assignee
-            components: List of component names to assign (e.g., ["Frontend", "API"])
+            components: Components to assign, as names (e.g., ["Frontend", "API"])
+                or {"id": ...} / {"name": ...} objects
             **kwargs: Additional fields to set on the issue
 
         Returns:
@@ -686,17 +716,18 @@ class IssuesMixin(
             # Add components if provided
             if components:
                 if isinstance(components, list):
-                    # Filter out any None or empty/whitespace-only strings
-                    valid_components = [
-                        comp_name.strip()
-                        for comp_name in components
-                        if isinstance(comp_name, str) and comp_name.strip()
-                    ]
+                    # Names become {"name": ...}; {"id"} / {"name"} objects are
+                    # kept. None, blank names and other items are skipped.
+                    valid_components: list[dict[str, Any]] = []
+                    for comp in components:
+                        if isinstance(comp, str) and comp.strip():
+                            valid_components.append({"name": comp.strip()})
+                        elif isinstance(comp, dict) and (
+                            "id" in comp or "name" in comp
+                        ):
+                            valid_components.append(comp)
                     if valid_components:
-                        # Format as list of {"name": ...} dicts for the API
-                        fields["components"] = [
-                            {"name": comp_name} for comp_name in valid_components
-                        ]
+                        fields["components"] = valid_components
 
             # Resolve epic link aliases (epicKey, epic_link, etc.) before
             # kwargs_copy so the alias is not double-processed.
@@ -719,6 +750,9 @@ class IssuesMixin(
 
             # Process **kwargs using the dynamic field map
             self._process_additional_fields(fields, kwargs_copy)
+
+            # The parent and epic link must not point outside the allowlist.
+            self.ensure_issue_relations_allowed(fields)
 
             # Create the issue (use v3 API on Cloud for any ADF field)
             has_adf = self._contains_adf_document(fields)
@@ -770,7 +804,7 @@ class IssuesMixin(
                 msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
                 logger.error(msg)
                 raise TypeError(msg)
-            return JiraIssue.from_api_response(issue_data)
+            return JiraIssue.from_api_response(issue_data, **output_scope_kwargs(self))
 
         except Exception as e:
             self._handle_create_issue_error(e, issue_type)
@@ -803,14 +837,13 @@ class IssuesMixin(
         return issue_type.lower() in epic_names or "epic" in issue_type.lower()
 
     def _find_epic_issue_type_id(self, project_key: str) -> str | None:
-        """
-        Find the actual Epic issue type name for a project.
+        """Find the Epic issue type ID for a project.
 
         Args:
             project_key: The project key
 
         Returns:
-            The Epic issue type name if found, None otherwise
+            The Epic issue type ID if found, None otherwise
         """
         try:
             issue_types = self.get_project_issue_types(project_key)
@@ -818,12 +851,35 @@ class IssuesMixin(
             for issue_type in issue_types:
                 type_name = issue_type.get("name", "")
                 if type_name.lower() == "epic":
-                    return issue_type.get("id")
-            # Second pass: fallback to any type containing "epic"
+                    type_id = issue_type.get("id")
+                    return str(type_id) if type_id is not None else None
+
+            # Second pass: identify the type structurally from its create fields.
+            # Jira Server/DC localizes issue type names but keeps the GreenHopper
+            # Epic Name field schema stable.
+            for issue_type in issue_types:
+                if issue_type.get("subtask") is True:
+                    continue
+                type_id = issue_type.get("id")
+                if type_id is None:
+                    continue
+                type_id_str = str(type_id)
+                create_fields = self.get_create_fields(project_key, type_id_str)
+                for field in create_fields:
+                    schema = field.get("schema", {})
+                    if (
+                        isinstance(schema, dict)
+                        and schema.get("custom") == _EPIC_NAME_FIELD_SCHEMA
+                    ):
+                        return type_id_str
+
+            # Final pass: retain the existing localized-name heuristic when
+            # create metadata is unavailable (for example, some Cloud projects).
             for issue_type in issue_types:
                 type_name = issue_type.get("name", "")
                 if self._is_epic_issue_type(type_name):
-                    return issue_type.get("id")
+                    type_id = issue_type.get("id")
+                    return str(type_id) if type_id is not None else None
             return None
         except Exception as e:
             logger.warning(f"Could not get issue types for project {project_key}: {e}")
@@ -983,6 +1039,29 @@ class IssuesMixin(
                 f"Try using the exact custom field ID (e.g., customfield_10014)."
             )
 
+    def _validate_parent_clear_supported(self, value: Any) -> None:
+        """Reject parent clearing on Jira Server/Data Center.
+
+        Jira Cloud accepts ``{"parent": null}`` for clearing a parent. Jira
+        Server/Data Center rejects the same request shape, so users must
+        update the Epic Link custom field directly instead.
+
+        Args:
+            value: The requested parent value.
+
+        Raises:
+            ValueError: If the value requests a parent clear on Server/DC.
+        """
+        if (value is None or value == "") and not self.config.is_cloud:
+            raise ValueError(
+                "Clearing an issue's parent with parent=None, parent='', or "
+                '{"parent": null} is supported only on Jira Cloud. Jira '
+                "Server/Data Center rejects this parent update format. To "
+                "clear an Epic Link on Server/DC, update its custom field "
+                'directly, for example {"customfield_10014": null}, using '
+                "the field ID returned by jira_search_fields."
+            )
+
     def _add_assignee_to_fields(self, fields: dict[str, Any], assignee: str) -> None:
         """
         Add assignee to issue fields.
@@ -1048,6 +1127,16 @@ class IssuesMixin(
             elif key in field_map:  # Check original case for system fields
                 api_field_id = field_map[key]
                 logger.debug(f"Identified field '{key}' as standard system field ID.")
+
+            if api_field_id == "project":
+                # The project comes only from the explicit project_key argument,
+                # which is checked against JIRA_PROJECTS_FILTER. Letting an
+                # additional field replace it would bypass that check.
+                logger.warning(
+                    f"Ignoring additional field '{key}': set the project with "
+                    "project_key instead."
+                )
+                continue
 
             if api_field_id:
                 # Allow None values to pass through for clearing fields
@@ -1142,6 +1231,38 @@ class IssuesMixin(
             return ",".join(return_fields)
         return return_fields
 
+    @staticmethod
+    def _merge_attachment_results(
+        first: dict[str, Any] | None, second: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Merge two attachment upload reports into a single one.
+
+        Path-based and in-memory uploads are independent sources that can be
+        used in the same call, but callers read one ``attachment_results``
+        entry, so their reports are combined.
+
+        Args:
+            first: Report of the first upload batch, or None
+            second: Report of the second upload batch, or None
+
+        Returns:
+            The combined report, or whichever side is not None
+        """
+        if not first:
+            return second
+        if not second:
+            return first
+
+        uploaded = list(first.get("uploaded", [])) + list(second.get("uploaded", []))
+        failed = list(first.get("failed", [])) + list(second.get("failed", []))
+        return {
+            "success": bool(uploaded),
+            "issue_key": first.get("issue_key") or second.get("issue_key"),
+            "total": first.get("total", 0) + second.get("total", 0),
+            "uploaded": uploaded,
+            "failed": failed,
+        }
+
     def update_issue(
         self,
         issue_key: str,
@@ -1161,6 +1282,8 @@ class IssuesMixin(
                 reduces the size of the returned issue.
             **kwargs: Additional fields to update. Special fields include:
                 - attachments: List of file paths to upload as attachments
+                - attachments_base64: List of dicts with 'filename' and
+                  'content' (bytes) keys, uploaded without reading from disk
                 - status: New status for the issue (handled via transitions)
                 - assignee: New assignee for the issue
                 - parent: Parent issue key (str or {"key": "..."} dict)
@@ -1196,6 +1319,16 @@ class IssuesMixin(
             kwargs_mutable = dict(kwargs)
             self._prepare_epic_link_fields(update_fields, kwargs_mutable)
 
+            # Jira Server/Data Center rejects the Cloud parent-clearing
+            # payload. Validate before any update or follow-up REST request.
+            if "parent" in kwargs_mutable:
+                self._validate_parent_clear_supported(kwargs_mutable["parent"])
+            elif "parent" in update_fields:
+                parent_value = update_fields["parent"]
+                self._validate_parent_clear_supported(parent_value)
+                if parent_value == "":
+                    update_fields["parent"] = None
+
             # Process kwargs
             for key, value in kwargs_mutable.items():
                 if key == "status":
@@ -1206,10 +1339,12 @@ class IssuesMixin(
                         issue_key, update_fields, return_fields=return_fields
                     )
 
-                elif key == "attachments":
-                    # Handle attachments separately - they're not part of fields update
+                elif key in ("attachments", "attachments_base64"):
+                    # Handled separately - they're not part of fields update.
+                    # Note both are skipped entirely when a "status" kwarg
+                    # returns above via _update_issue_with_status.
                     if not value or not isinstance(value, list | tuple):
-                        logger.warning(f"Invalid attachments value: {value}")
+                        logger.warning(f"Invalid {key} value: {value}")
 
                 elif key == "assignee":
                     # Handle assignee updates, allow unassignment with None or empty string
@@ -1238,7 +1373,10 @@ class IssuesMixin(
                                 f"Could not update assignee: {str(e)}"
                             ) from e
                 elif key == "parent":
-                    if isinstance(value, dict) and value.get("key"):
+                    # Jira Cloud accepts an explicit null to clear the parent.
+                    if value is None or value == "":
+                        update_fields["parent"] = None
+                    elif isinstance(value, dict) and value.get("key"):
                         update_fields["parent"] = {"key": str(value["key"])}
                     elif isinstance(value, str) and value:
                         update_fields["parent"] = {"key": value}
@@ -1260,6 +1398,7 @@ class IssuesMixin(
 
             # Update the issue fields (use v3 API on Cloud for any ADF field)
             if update_fields:
+                self.ensure_issue_relations_allowed(update_fields)
                 has_adf = self._contains_adf_document(update_fields)
                 if has_adf and self.config.is_cloud:
                     if preserve_description_media:
@@ -1293,6 +1432,27 @@ class IssuesMixin(
                     )
                     # Continue with the update even if attachments fail
 
+            # Handle in-memory attachments if provided. Both sources are
+            # additive, so their results are merged into a single report.
+            if "attachments_base64" in kwargs and kwargs["attachments_base64"]:
+                try:
+                    content_result = self.upload_attachments_from_content(
+                        issue_key, kwargs["attachments_base64"]
+                    )
+                    logger.info(
+                        f"Uploaded in-memory attachments to {issue_key}: "
+                        f"{content_result}"
+                    )
+                    attachments_result = self._merge_attachment_results(
+                        attachments_result, content_result
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Error uploading in-memory attachments to "
+                        f"{issue_key}: {str(e)}"
+                    )
+                    # Continue with the update even if attachments fail
+
             # Get the updated issue data and convert to JiraIssue model
             issue_data = self.jira.get_issue(issue_key, fields=return_fields_param)
             if isinstance(issue_data, str):
@@ -1316,7 +1476,9 @@ class IssuesMixin(
                 logger.error(msg)
                 raise TypeError(msg)
             issue = JiraIssue.from_api_response(
-                issue_data, requested_fields=return_fields_param
+                issue_data,
+                requested_fields=return_fields_param,
+                **output_scope_kwargs(self),
             )
 
             # Add attachment results to the response if available
@@ -1325,6 +1487,8 @@ class IssuesMixin(
 
             return issue
 
+        except ScopeViolationError:
+            raise
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error updating issue {issue_key}: {error_msg}")
@@ -1385,7 +1549,7 @@ class IssuesMixin(
                         )
                 self.jira.assign_issue(issue_key, str(assignee_identifier))
             else:
-                account_id = self._get_account_id(assignee)
+                account_id = self._get_account_id(assignee, issue_key=issue_key)
                 self.jira.assign_issue(issue_key, account_id)
 
             # Return the updated issue
@@ -1424,6 +1588,7 @@ class IssuesMixin(
 
         # First update any fields if needed
         if fields:
+            self.ensure_issue_relations_allowed(fields)
             self.jira.update_issue(issue_key=issue_key, update={"fields": fields})
 
         # If no status change is requested, return the issue
@@ -1434,7 +1599,9 @@ class IssuesMixin(
                 logger.error(msg)
                 raise TypeError(msg)
             return JiraIssue.from_api_response(
-                issue_data, requested_fields=return_fields_param
+                issue_data,
+                requested_fields=return_fields_param,
+                **output_scope_kwargs(self),
             )
 
         # Get available transitions (uses TransitionsMixin's normalized implementation)
@@ -1535,7 +1702,9 @@ class IssuesMixin(
             logger.error(msg)
             raise TypeError(msg)
         return JiraIssue.from_api_response(
-            issue_data, requested_fields=return_fields_param
+            issue_data,
+            requested_fields=return_fields_param,
+            **output_scope_kwargs(self),
         )
 
     def delete_issue(self, issue_key: str) -> bool:
@@ -1686,7 +1855,7 @@ class IssuesMixin(
                 msg = f"Unexpected return value type from `jira.get_issue`: {type(issue_data)}"
                 logger.error(msg)
                 raise TypeError(msg)
-            return JiraIssue.from_api_response(issue_data)
+            return JiraIssue.from_api_response(issue_data, **output_scope_kwargs(self))
 
         except (ValueError, NotImplementedError, TypeError):
             raise
@@ -1926,6 +2095,7 @@ class IssuesMixin(
 
                 # Add any remaining custom fields
                 self._process_additional_fields(fields, issue_data)
+                self.ensure_issue_relations_allowed(fields)
 
                 if validate_only:
                     # For validation, just log the issue that would be created
@@ -1937,6 +2107,8 @@ class IssuesMixin(
                 # Add to bulk creation list
                 issue_updates.append({"fields": fields})
 
+            except ScopeViolationError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to prepare issue for creation: {str(e)}")
                 if not issue_updates:
@@ -1981,6 +2153,7 @@ class IssuesMixin(
                                 base_url=self.config.url
                                 if hasattr(self, "config")
                                 else None,
+                                **output_scope_kwargs(self),
                             )
                         )
                     except Exception as e:
@@ -2047,9 +2220,14 @@ class IssuesMixin(
 
                 issue_changelog_results[issue_id].extend(changelogs)
 
+        allowed = allowed_project_keys(self.config)
+        if allowed:
+            kinds = output_scope_kwargs(self)["changelog_field_kinds"]()
+            for changelogs in issue_changelog_results.values():
+                restrict_changelogs(changelogs, allowed, kinds)
         issues = [
             JiraIssue(id=issue_id, changelogs=changelogs)
             for issue_id, changelogs in issue_changelog_results.items()
         ]
 
-        return issues
+        return merge_truncation(issues, paged_api_results)
